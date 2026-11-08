@@ -1,0 +1,1564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Banking Situation Awareness — Pekko Agent &amp; Workflow Inspector</title>
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    /* Default theme tokens for standard web browsers (Chrome / Firefox / Safari at http://127.0.0.1:8088) */
+    html {
+      --background: #0b1120;
+      --card: #111827;
+      --foreground: #f8fafc;
+      --muted-foreground: #94a3b8;
+      --border: #1e293b;
+      --primary: #3b82f6;
+      --primary-foreground: #ffffff;
+      --secondary: #1e293b;
+      --secondary-foreground: #e2e8f0;
+    }
+    body {
+      background-color: var(--background);
+      color: var(--foreground);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      margin: 0;
+    }
+    button {
+      cursor: pointer;
+      user-select: none;
+    }
+    button:active {
+      transform: translateY(1px);
+    }
+    .btn-primary-action {
+      background-color: #2563eb;
+      color: #ffffff;
+      border: 1px solid #3b82f6;
+      padding: 0.5rem 1rem;
+      border-radius: 0.5rem;
+      font-weight: 600;
+      font-size: 0.75rem;
+      transition: all 0.15s ease;
+    }
+    .btn-primary-action:hover {
+      background-color: #1d4ed8;
+    }
+    .btn-secondary-action {
+      background-color: #1e293b;
+      color: #e2e8f0;
+      border: 1px solid #334155;
+      padding: 0.45rem 0.85rem;
+      border-radius: 0.5rem;
+      font-weight: 500;
+      font-size: 0.75rem;
+      transition: all 0.15s ease;
+    }
+    .btn-secondary-action:hover {
+      background-color: #334155;
+      border-color: #60a5fa;
+    }
+    .step-card-btn {
+      background-color: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 0.65rem;
+      padding: 0.85rem;
+      text-align: left;
+      width: 100%;
+      color: var(--foreground);
+      transition: all 0.15s ease;
+    }
+    .step-card-btn:hover {
+      border-color: #3b82f6;
+      background-color: #1e293b;
+    }
+    .step-card-active {
+      border-color: #3b82f6 !important;
+      box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.35);
+    }
+    input, select {
+      background-color: #0f172a;
+      color: #f8fafc;
+      border: 1px solid #334155;
+    }
+    input:focus, select:focus {
+      outline: none;
+      border-color: #3b82f6;
+    }
+  </style>
+</head>
+<body class="bg-[var(--background)] text-[var(--foreground)] antialiased p-4 md:p-6">
+
+  <!-- TOP HEADER & CONNECTION STATUS -->
+  <div class="max-w-7xl mx-auto space-y-5">
+    <div class="bg-[var(--card)] border border-[var(--border)] rounded-xl p-5 shadow-sm flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+      <div>
+        <div class="flex items-center gap-2.5 flex-wrap">
+          <span class="px-2.5 py-1 rounded-md text-xs font-semibold bg-blue-600 text-white">
+            SCALA 3 + KAFKA + FLINK + PEKKO SHARDING
+          </span>
+          <span id="connectionBadge" class="px-2.5 py-1 rounded-md text-xs font-medium bg-[var(--secondary)] text-[var(--secondary-foreground)] border border-[var(--border)]">
+            Checking Pekko HTTP Server...
+          </span>
+          <span id="actionToast" class="hidden px-2.5 py-1 rounded-md text-xs font-semibold bg-blue-500/20 text-blue-400 border border-blue-500/40">
+            Ready
+          </span>
+        </div>
+        <h1 class="text-xl md:text-2xl font-bold mt-2 text-[var(--foreground)]">
+          Real-Time Customer Situation Awareness &amp; Explainable Credit Workbench
+        </h1>
+        <p class="text-sm text-[var(--muted-foreground)] mt-1">
+          Interactive business &amp; architecture console: inspect sharded <code class="px-1.5 py-0.5 rounded bg-[var(--secondary)] text-xs">CustomerAgent</code> Digital Twins, actor-to-actor 2nd-hop risk propagation, and regulatory Adverse Action notices.
+        </p>
+      </div>
+      <div class="flex flex-wrap items-center gap-2.5">
+        <button type="button" id="btnRunFullDemo" onclick="window.runFullGuidedDemo()" class="btn-primary-action">
+          &#9654; Run Full Guided Demo
+        </button>
+        <button type="button" id="btnResetWorkbench" onclick="window.resetSimulationState()" class="btn-secondary-action">
+          &#8635; Reset Workbench
+        </button>
+      </div>
+    </div>
+
+    <!-- GUIDED SCENARIO STEPPER BAR -->
+    <div class="bg-[var(--card)] border border-[var(--border)] rounded-xl p-4 shadow-sm">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+        <h2 class="text-sm font-semibold text-[var(--foreground)]">
+          Guided Business Scenario Walkthrough (Click any step in order or jump directly)
+        </h2>
+        <span id="scenarioStatusText" class="text-xs font-semibold text-blue-400">
+          Ready to start walkthrough
+        </span>
+      </div>
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+        <button type="button" onclick="window.triggerScenarioStep('step1-bootstrap')" id="btn-step1" class="step-card-btn">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold text-blue-400">STEP 1 &middot; PERCEPTION</span>
+            <span class="text-xs px-2 py-0.5 rounded bg-blue-600/20 text-blue-300 font-semibold">Run Step 1 &rarr;</span>
+          </div>
+          <div class="text-sm font-semibold mt-1.5">Hydrate Profiles &amp; Peer Link</div>
+          <p class="text-xs text-[var(--muted-foreground)] mt-1">
+            Ingest verified payslips (Alice 4,200 EUR, Bob 3,500 EUR) &amp; bilateral P2P transfer <code class="text-xs">TX-PEER-101</code>.
+          </p>
+        </button>
+
+        <button type="button" onclick="window.triggerScenarioStep('step2-alice-healthy-loan')" id="btn-step2" class="step-card-btn">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold text-emerald-400">STEP 2 &middot; BASELINE DECISION</span>
+            <span class="text-xs px-2 py-0.5 rounded bg-emerald-600/20 text-emerald-300 font-semibold">Run Step 2 &rarr;</span>
+          </div>
+          <div class="text-sm font-semibold mt-1.5">Alice Healthy Loan (12,000 EUR)</div>
+          <p class="text-xs text-[var(--muted-foreground)] mt-1">
+            Evaluate <code class="text-xs">LOAN-ALICE-01</code> against clean in-memory state &rarr; <strong>APPROVED (800/850)</strong>.
+          </p>
+        </button>
+
+        <button type="button" onclick="window.triggerScenarioStep('step3-bob-sanction-contagion')" id="btn-step3" class="step-card-btn">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold text-amber-400">STEP 3 &middot; ACTOR CONTAGION</span>
+            <span class="text-xs px-2 py-0.5 rounded bg-amber-600/20 text-amber-300 font-semibold">Run Step 3 &rarr;</span>
+          </div>
+          <div class="text-sm font-semibold mt-1.5">Bob Sanctioned Tx &amp; 2nd-Hop Signal</div>
+          <p class="text-xs text-[var(--muted-foreground)] mt-1">
+            Bob pays <code class="text-xs">ENTITY-SHADOW-LTD</code>. Bob's agent automatically alerts Alice's agent via <code class="text-xs">PropagatePeerRisk</code>!
+          </p>
+        </button>
+
+        <button type="button" onclick="window.triggerScenarioStep('step4-alice-distress-loan')" id="btn-step4" class="step-card-btn">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold text-rose-400">STEP 4 &middot; ADVERSE ACTION</span>
+            <span class="text-xs px-2 py-0.5 rounded bg-rose-600/20 text-rose-300 font-semibold">Run Step 4 &rarr;</span>
+          </div>
+          <div class="text-sm font-semibold mt-1.5">Alice Distress &amp; Loan Denial</div>
+          <p class="text-xs text-[var(--muted-foreground)] mt-1">
+            Alice records 2 gambling overdrafts + 2nd-hop contagion &rarr; <strong>DENIED (395/850)</strong> with legal reasons.
+          </p>
+        </button>
+      </div>
+    </div>
+
+    <!-- ARCHITECTURE PIPELINE & AGENT COMMUNICATION VISUALIZER -->
+    <div class="bg-[var(--card)] border border-[var(--border)] rounded-xl p-5 shadow-sm">
+      <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-4">
+        <div>
+          <h2 class="text-base font-bold text-[var(--foreground)]">
+            Live Architecture Pipeline &amp; Inter-Agent Communication Map
+          </h2>
+          <p class="text-xs text-[var(--muted-foreground)]">
+            Click any <code class="text-xs">CustomerAgent</code> shard below to inspect its internal ring buffers, verified documents, and ego-network provenance.
+          </p>
+        </div>
+        <div class="flex items-center gap-3 text-xs">
+          <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block"></span> Clean Situation</span>
+          <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-amber-500 inline-block"></span> 2nd-Hop Contagion</span>
+          <span class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-rose-500 inline-block"></span> 1st-Hop Restricted / Distress</span>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
+        <!-- Stage 1: Kafka + Flink Perception -->
+        <div class="lg:col-span-3 p-4 rounded-xl border border-[var(--border)] bg-[var(--background)] flex flex-col justify-between">
+          <div>
+            <div class="text-xs font-bold uppercase tracking-wider text-[var(--muted-foreground)]">Level 1 &middot; Perception</div>
+            <div class="text-sm font-bold mt-1">Kafka + Flink Enrichment</div>
+            <div class="mt-3 space-y-2 text-xs">
+              <div class="p-2.5 rounded-lg bg-[var(--card)] border border-[var(--border)]">
+                <div class="font-semibold">1. BilateralTransactionSplitter</div>
+                <div class="text-[var(--muted-foreground)] mt-0.5">Splits raw transfer into <code class="text-xs">Outflow</code> &amp; <code class="text-xs">Inflow</code> keyed by <code class="text-xs">CustomerId</code>.</div>
+              </div>
+              <div class="p-2.5 rounded-lg bg-[var(--card)] border border-[var(--border)]">
+                <div class="font-semibold">2. WatchlistBroadcastEnricher</div>
+                <div class="text-[var(--muted-foreground)] mt-0.5">Tags 1st-hop restricted entities in O(1) Flink Broadcast State:</div>
+                <div id="watchlistPills" class="flex flex-wrap gap-1 mt-1.5"></div>
+              </div>
+            </div>
+          </div>
+          <div class="mt-3 pt-2 border-t border-[var(--border)] text-xs text-[var(--muted-foreground)] flex justify-between">
+            <span>Topic: <code class="text-xs">customer.situation.events.v1</code></span>
+            <span>128 Partitions</span>
+          </div>
+        </div>
+
+        <!-- Stage 2: Pekko Cluster Sharding CustomerAgents -->
+        <div class="lg:col-span-6 p-4 rounded-xl border border-[var(--border)] bg-[var(--background)] flex flex-col justify-between">
+          <div>
+            <div class="flex items-center justify-between">
+              <div>
+                <div class="text-xs font-bold uppercase tracking-wider text-[var(--muted-foreground)]">Level 2 &middot; Comprehension</div>
+                <div class="text-sm font-bold mt-1">Apache Pekko Cluster Sharding (<code class="text-xs">CustomerAgent</code> Actors)</div>
+              </div>
+              <span id="activeAgentCountBadge" class="px-2 py-0.5 rounded text-xs font-semibold bg-[var(--secondary)] text-[var(--secondary-foreground)]">
+                0 Active Shards
+              </span>
+            </div>
+
+            <!-- Agent Cards Grid -->
+            <div id="agentCardsContainer" class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+              <!-- Populated dynamically -->
+            </div>
+
+            <!-- Live Inter-Agent Risk Signal Banner -->
+            <div id="ipcSignalBanner" class="mt-3 p-3 rounded-lg border border-[var(--border)] bg-[var(--card)]">
+              <div class="text-xs font-semibold text-[var(--muted-foreground)]">
+                Decentralized Graph Protocol (<code class="text-xs">PeerRiskRouter</code>)
+              </div>
+              <div id="ipcSignalContent" class="text-xs mt-1 text-[var(--foreground)]">
+                No 2nd-hop <code class="text-xs">PeerRiskSignal</code> messages propagated yet. Run <strong>Step 3</strong> or inject a restricted transaction to observe actor-to-actor risk contagion.
+              </div>
+            </div>
+          </div>
+          <div class="mt-3 pt-2 border-t border-[var(--border)] text-xs text-[var(--muted-foreground)] flex justify-between">
+            <span>Persistence: <code class="text-xs">EventSourcedBehavior</code></span>
+            <span>Attenuation: <code class="text-xs">R2 = R1 &times; 0.65 (Max 2 Hops)</code></span>
+          </div>
+        </div>
+
+        <!-- Stage 3: Explainable Credit Engine -->
+        <div class="lg:col-span-3 p-4 rounded-xl border border-[var(--border)] bg-[var(--background)] flex flex-col justify-between">
+          <div>
+            <div class="text-xs font-bold uppercase tracking-wider text-[var(--muted-foreground)]">Level 3 &middot; Projection &amp; XAI</div>
+            <div class="text-sm font-bold mt-1">Explainable Credit Engine</div>
+            <div class="mt-3 space-y-2 text-xs">
+              <div class="p-2.5 rounded-lg bg-[var(--card)] border border-[var(--border)]">
+                <div class="font-semibold">Hybrid Rules + Scorecard</div>
+                <div class="text-[var(--muted-foreground)] mt-0.5">Base Score: <strong>750</strong> | Min Approval: <strong>620</strong></div>
+              </div>
+              <div class="p-2.5 rounded-lg bg-[var(--card)] border border-[var(--border)] space-y-1">
+                <div class="font-semibold">Active Policy Rules:</div>
+                <div class="text-[var(--muted-foreground)]">&bull; <code class="text-xs">RULE_AFFORDABILITY_DTI</code> (&le; 40%)</div>
+                <div class="text-[var(--muted-foreground)]">&bull; <code class="text-xs">RULE_LIQUIDITY_OVERDRAFT</code> (&le; 1 / 30d)</div>
+                <div class="text-[var(--muted-foreground)]">&bull; <code class="text-xs">RULE_HIGH_RISK_VELOCITY</code> (&le; 15%)</div>
+                <div class="text-[var(--muted-foreground)]">&bull; <code class="text-xs">RULE_RESTRICTED_1HOP</code> (Knockout)</div>
+                <div class="text-[var(--muted-foreground)]">&bull; <code class="text-xs">RULE_NETWORK_CONTAGION_2HOP</code> (&lt; 0.45)</div>
+              </div>
+            </div>
+          </div>
+          <div class="mt-3 pt-2 border-t border-[var(--border)] text-xs text-[var(--muted-foreground)] flex justify-between">
+            <span>EU AI Act / GDPR Art. 22</span>
+            <span>Latency: <code class="text-xs">&lt; 5ms</code></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- MAIN WORKSPACE GRID: LEFT = SELECTED AGENT INSPECTOR & PLAYGROUND | RIGHT = DECISION & WORKFLOW TRACE -->
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-5">
+
+      <!-- LEFT COLUMN (7 cols): AGENT INTERNAL STATE INSPECTOR + INTERACTIVE REQUEST FORMS -->
+      <div class="lg:col-span-7 space-y-5">
+
+        <!-- SELECTED AGENT DEEP-DIVE INSPECTOR -->
+        <div class="bg-[var(--card)] border border-[var(--border)] rounded-xl p-5 shadow-sm">
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-[var(--border)]">
+            <div>
+              <span class="text-xs font-bold uppercase text-blue-400">Pekko Actor Memory Inspector</span>
+              <h3 id="selectedAgentTitle" class="text-lg font-bold text-[var(--foreground)]">
+                CustomerAgent(CUST-ALICE-001)
+              </h3>
+            </div>
+            <div class="flex items-center gap-2">
+              <label class="text-xs text-[var(--muted-foreground)]">Select Agent:</label>
+              <select id="agentSelectDropdown" onchange="window.selectCustomerAgent(this.value)" class="px-2.5 py-1.5 rounded-lg text-xs font-semibold">
+              </select>
+            </div>
+          </div>
+
+          <!-- 30-Day Sliding Window Ring Buffer Metrics -->
+          <div class="mt-4">
+            <div class="text-xs font-semibold text-[var(--muted-foreground)] mb-2">
+              1. In-Memory Incremental Cashflow Ring Buffer (<code class="text-xs">SlidingWindowCashflow</code> &mdash; 30-Day Window)
+            </div>
+            <div id="agentMetricsGrid" class="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+              <!-- Populated dynamically -->
+            </div>
+          </div>
+
+          <!-- Verified Documents & Ego-Network Connections -->
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+            <div class="p-3.5 rounded-lg border border-[var(--border)] bg-[var(--background)]">
+              <div class="text-xs font-semibold text-[var(--foreground)] mb-2">
+                2. Verified External Document Facts (<code class="text-xs">verifiedFacts</code>)
+              </div>
+              <div id="agentDocsList" class="space-y-1.5 text-xs"></div>
+            </div>
+
+            <div class="p-3.5 rounded-lg border border-[var(--border)] bg-[var(--background)]">
+              <div class="text-xs font-semibold text-[var(--foreground)] mb-2">
+                3. Localized Ego-Network Peers (<code class="text-xs">egoNetwork</code>)
+              </div>
+              <div id="agentPeersList" class="space-y-1.5 text-xs"></div>
+            </div>
+          </div>
+
+          <!-- 1st-Hop & 2nd-Hop Risk Exposure Provenance Table -->
+          <div class="mt-4 p-3.5 rounded-lg border border-[var(--border)] bg-[var(--background)]">
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-xs font-semibold text-[var(--foreground)]">
+                4. Relationship &amp; Watchlist Risk Provenance (<code class="text-xs">riskExposures</code>)
+              </span>
+              <span id="agentMaxRiskBadge" class="text-xs font-bold px-2 py-0.5 rounded bg-[var(--secondary)]">
+                Max Network Risk: 0.00
+              </span>
+            </div>
+            <div id="agentRiskExposuresList" class="space-y-2 text-xs"></div>
+          </div>
+        </div>
+
+        <!-- INTERACTIVE PLAYGROUND: START A NEW REQUEST -->
+        <div class="bg-[var(--card)] border border-[var(--border)] rounded-xl p-5 shadow-sm">
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-[var(--border)]">
+            <div>
+              <span class="text-xs font-bold uppercase text-blue-400">Interactive Business Playground</span>
+              <h3 class="text-base font-bold text-[var(--foreground)]">
+                Start a New Request (Loan Application, Transaction Stream, or Document Fact)
+              </h3>
+            </div>
+            <div class="flex rounded-lg border border-[var(--border)] overflow-hidden text-xs">
+              <button type="button" onclick="window.switchPlaygroundTab('loan')" id="tab-btn-loan" class="px-3 py-1.5 font-semibold bg-blue-600 text-white">
+                1. New Loan Request
+              </button>
+              <button type="button" onclick="window.switchPlaygroundTab('tx')" id="tab-btn-tx" class="px-3 py-1.5 font-medium bg-[var(--background)] text-[var(--foreground)]">
+                2. Inject Transaction
+              </button>
+              <button type="button" onclick="window.switchPlaygroundTab('doc')" id="tab-btn-doc" class="px-3 py-1.5 font-medium bg-[var(--background)] text-[var(--foreground)]">
+                3. Upload Document
+              </button>
+            </div>
+          </div>
+
+          <!-- TAB 1: NEW LOAN APPLICATION FORM -->
+          <div id="playground-tab-loan" class="mt-4 space-y-3">
+            <p class="text-xs text-[var(--muted-foreground)]">
+              Sends <code class="text-xs">POST /api/v1/loans/evaluate</code> (or gRPC <code class="text-xs">LoanOriginationService/EvaluateLoan</code>) to the customer's sharded Pekko actor.
+            </p>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+              <div>
+                <label class="block font-semibold mb-1">Customer ID (Target Agent Shard)</label>
+                <input id="loanCustomerId" type="text" value="CUST-ALICE-001" class="w-full px-3 py-2 rounded-lg" />
+              </div>
+              <div>
+                <label class="block font-semibold mb-1">Application ID</label>
+                <input id="loanAppId" type="text" value="LOAN-CUSTOM-101" class="w-full px-3 py-2 rounded-lg" />
+              </div>
+              <div>
+                <label class="block font-semibold mb-1">Requested Loan Amount (EUR)</label>
+                <input id="loanAmount" type="number" step="500" value="15000" class="w-full px-3 py-2 rounded-lg" />
+              </div>
+              <div class="grid grid-cols-2 gap-2">
+                <div>
+                  <label class="block font-semibold mb-1">Term (Months)</label>
+                  <input id="loanTerm" type="number" value="24" class="w-full px-3 py-2 rounded-lg" />
+                </div>
+                <div>
+                  <label class="block font-semibold mb-1">Annual Rate</label>
+                  <input id="loanRate" type="number" step="0.005" value="0.065" class="w-full px-3 py-2 rounded-lg" />
+                </div>
+              </div>
+            </div>
+            <div class="flex flex-wrap items-center justify-between gap-2 pt-2">
+              <div class="flex flex-wrap gap-1.5 text-xs">
+                <button type="button" onclick="window.fillLoanPreset('CUST-ALICE-001', 12000, 24)" class="btn-secondary-action">
+                  Preset: Alice 12k EUR
+                </button>
+                <button type="button" onclick="window.fillLoanPreset('CUST-ALICE-001', 45000, 24)" class="btn-secondary-action">
+                  Preset: Alice High DTI (45k EUR)
+                </button>
+                <button type="button" onclick="window.fillLoanPreset('CUST-BOB-002', 10000, 24)" class="btn-secondary-action">
+                  Preset: Bob 10k EUR
+                </button>
+              </div>
+              <button type="button" onclick="window.submitCustomLoanRequest()" class="btn-primary-action">
+                Evaluate Loan Request &rarr;
+              </button>
+            </div>
+          </div>
+
+          <!-- TAB 2: INJECT TRANSACTION FORM -->
+          <div id="playground-tab-tx" class="mt-4 space-y-3 hidden">
+            <p class="text-xs text-[var(--muted-foreground)]">
+              Pushes a raw transaction into <code class="text-xs">FlinkTransactionEnrichment</code> (bilateral splitting + watchlist broadcast lookup) and routes it to the target <code class="text-xs">CustomerAgent</code> shard(s).
+            </p>
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+              <div>
+                <label class="block font-semibold mb-1">Transaction ID</label>
+                <input id="txIdInput" type="text" value="TX-LIVE-501" class="w-full px-3 py-2 rounded-lg" />
+              </div>
+              <div>
+                <label class="block font-semibold mb-1">From Customer ID (Sender)</label>
+                <input id="txFromInput" type="text" value="CUST-CHARLIE-003" class="w-full px-3 py-2 rounded-lg" />
+              </div>
+              <div>
+                <label class="block font-semibold mb-1">To Counterparty ID (Recipient)</label>
+                <input id="txToInput" type="text" value="CUST-ALICE-001" class="w-full px-3 py-2 rounded-lg" />
+              </div>
+              <div>
+                <label class="block font-semibold mb-1">Amount (EUR)</label>
+                <input id="txAmountInput" type="number" step="100" value="950" class="w-full px-3 py-2 rounded-lg" />
+              </div>
+              <div>
+                <label class="block font-semibold mb-1">Category</label>
+                <select id="txCategoryInput" class="w-full px-3 py-2 rounded-lg">
+                  <option value="PeerTransfer">PeerTransfer</option>
+                  <option value="Salary">Salary</option>
+                  <option value="EverydaySpend">EverydaySpend</option>
+                  <option value="Housing">Housing</option>
+                  <option value="Gambling">Gambling (High-Risk)</option>
+                  <option value="HighRiskTransfer">HighRiskTransfer</option>
+                </select>
+              </div>
+              <div class="flex flex-col justify-center gap-1.5 pt-3">
+                <label class="inline-flex items-center gap-2 cursor-pointer">
+                  <input id="txIsBankClientInput" type="checkbox" checked class="rounded" />
+                  <span>Counterparty is Bank Client</span>
+                </label>
+                <label class="inline-flex items-center gap-2 cursor-pointer">
+                  <input id="txOverdraftInput" type="checkbox" class="rounded" />
+                  <span>Results in Overdraft</span>
+                </label>
+              </div>
+            </div>
+            <div class="flex flex-wrap items-center justify-between gap-2 pt-2">
+              <div class="flex flex-wrap gap-1.5 text-xs">
+                <button type="button" onclick="window.fillTxPreset('CUST-CHARLIE-003', 'CUST-ALICE-001', 800, 'PeerTransfer', true, false)" class="btn-secondary-action">
+                  Preset: Link Charlie &rarr; Alice
+                </button>
+                <button type="button" onclick="window.fillTxPreset('CUST-CHARLIE-003', 'UNLICENSED-LENDER-88', 2500, 'HighRiskTransfer', false, false)" class="btn-secondary-action">
+                  Preset: Charlie &rarr; Unlicensed Lender (Watchlist!)
+                </button>
+              </div>
+              <button type="button" onclick="window.submitCustomTransaction()" class="btn-primary-action">
+                Ingest Transaction Event &rarr;
+              </button>
+            </div>
+          </div>
+
+          <!-- TAB 3: UPLOAD VERIFIED DOCUMENT FORM -->
+          <div id="playground-tab-doc" class="mt-4 space-y-3 hidden">
+            <p class="text-xs text-[var(--muted-foreground)]">
+              Updates the customer's verified external document facts (<code class="text-xs">POST /api/v1/customers/{id}/documents</code>).
+            </p>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+              <div>
+                <label class="block font-semibold mb-1">Customer ID</label>
+                <input id="docCustomerId" type="text" value="CUST-CHARLIE-003" class="w-full px-3 py-2 rounded-lg" />
+              </div>
+              <div>
+                <label class="block font-semibold mb-1">Document ID</label>
+                <input id="docIdInput" type="text" value="DOC-PAYSLIP-CHARLIE-01" class="w-full px-3 py-2 rounded-lg" />
+              </div>
+              <div>
+                <label class="block font-semibold mb-1">Document Fact Type</label>
+                <select id="docFactTypeInput" class="w-full px-3 py-2 rounded-lg">
+                  <option value="VerifiedMonthlyNetIncome">VerifiedMonthlyNetIncome</option>
+                  <option value="ExternalDebtObligation">ExternalDebtObligation</option>
+                  <option value="EmploymentContractStatus">EmploymentContractStatus</option>
+                </select>
+              </div>
+              <div>
+                <label class="block font-semibold mb-1">Verified Monthly Amount (EUR)</label>
+                <input id="docNumericInput" type="number" step="100" value="4800" class="w-full px-3 py-2 rounded-lg" />
+              </div>
+            </div>
+            <div class="flex justify-end pt-2">
+              <button type="button" onclick="window.submitCustomDocumentFact()" class="btn-primary-action">
+                Ingest Verified Document &rarr;
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT COLUMN (5 cols): EXPLAINABLE CREDIT DECISION VIEWER + INTERNAL WORKFLOW LOG -->
+      <div class="lg:col-span-5 space-y-5">
+
+        <!-- EXPLAINABLE CREDIT DECISION & ADVERSE ACTION NOTICE VIEWER -->
+        <div class="bg-[var(--card)] border border-[var(--border)] rounded-xl p-5 shadow-sm">
+          <div class="flex items-center justify-between pb-3 border-b border-[var(--border)]">
+            <div>
+              <span class="text-xs font-bold uppercase text-blue-400">Level 3 &middot; Explainable Decision Output</span>
+              <h3 class="text-base font-bold text-[var(--foreground)]">
+                Regulatory Statement of Reasons &amp; Scorecard Trace
+              </h3>
+            </div>
+            <select id="decisionHistoryDropdown" onchange="window.selectDecisionByIndex(this.value)" class="px-2.5 py-1 rounded-lg text-xs">
+              <option value="0">Latest Evaluation</option>
+            </select>
+          </div>
+
+          <div id="decisionViewerContainer" class="mt-4">
+            <!-- Populated dynamically -->
+          </div>
+        </div>
+
+        <!-- INTERNAL WORKFLOW & INTER-AGENT MESSAGE STREAM -->
+        <div class="bg-[var(--card)] border border-[var(--border)] rounded-xl p-5 shadow-sm">
+          <div class="flex items-center justify-between pb-3 border-b border-[var(--border)]">
+            <div>
+              <span class="text-xs font-bold uppercase text-blue-400">Internal Mechanism Telemetry</span>
+              <h3 class="text-base font-bold text-[var(--foreground)]">
+                Flink Enrichment &amp; Pekko Actor Message Bus Log
+              </h3>
+            </div>
+            <select id="traceFilterSelect" onchange="window.renderWorkflowTraces()" class="px-2.5 py-1 rounded-lg text-xs">
+              <option value="ALL">All Stages</option>
+              <option value="AGENT_TO_AGENT_IPC">Agent-to-Agent IPC Only</option>
+              <option value="FLINK_ENRICHMENT">Flink Enrichment Only</option>
+              <option value="PEKKO_SHARD_ACTOR">Pekko Shard Actor Only</option>
+              <option value="EXPLAINABLE_ENGINE">Explainable Engine Only</option>
+            </select>
+          </div>
+
+          <div id="workflowTraceContainer" class="mt-3 space-y-2.5 max-h-[460px] overflow-y-auto pr-1">
+            <!-- Populated dynamically -->
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Dynamically detect whether we are served from Pekko HTTP (e.g. http://127.0.0.1:8088) or opened via file://
+    const CANDIDATE_BASES = (window.location.protocol === "http:" || window.location.protocol === "https:")
+      ? [window.location.origin, "http://127.0.0.1:8088", "http://127.0.0.1:8080"]
+      : ["http://127.0.0.1:8088", "http://127.0.0.1:8080"];
+
+    let activeApiBase = CANDIDATE_BASES[0];
+    let isBackendConnected = false;
+    let selectedCustomerId = "CUST-ALICE-001";
+    let selectedDecisionIdx = 0;
+    let txSeqCounter = 501;
+
+    function showActionFeedback(message) {
+      const toast = document.getElementById("actionToast");
+      const statusText = document.getElementById("scenarioStatusText");
+      if (statusText) statusText.textContent = message;
+      if (toast) {
+        toast.textContent = message;
+        toast.classList.remove("hidden");
+        clearTimeout(window.__toastTimer);
+        window.__toastTimer = setTimeout(() => toast.classList.add("hidden"), 4000);
+      }
+    }
+
+    // Embedded fallback simulation state matching the exact Scala 3 domain & engine rules
+    let localState = createInitialLocalState();
+
+    function createInitialLocalState() {
+      return {
+        seqNo: 0,
+        watchlist: [
+          {
+            entityId: "ENTITY-SHADOW-LTD",
+            level: "SanctionedEntity",
+            baseRiskWeight: 1.00,
+            listSource: "EU-AML-SANCTIONS-2026",
+            reasonDescription: "Sanctioned shell company linked to illicit financial flows"
+          },
+          {
+            entityId: "UNLICENSED-LENDER-88",
+            level: "UnlicensedLender",
+            baseRiskWeight: 0.75,
+            listSource: "NATIONAL-REGULATOR-WATCHLIST",
+            reasonDescription: "Unlicensed predatory credit provider"
+          },
+          {
+            entityId: "DARKNET-EXCHANGE-X",
+            level: "FraudWatchlist",
+            baseRiskWeight: 0.90,
+            listSource: "GLOBAL-FRAUD-INTELLIGENCE",
+            reasonDescription: "High-risk mixer and fraud ring settlement account"
+          }
+        ],
+        customers: {},
+        workflowTraces: [],
+        recentDecisions: []
+      };
+    }
+
+    function ensureLocalCustomer(customerId) {
+      if (!localState.customers[customerId]) {
+        localState.customers[customerId] = {
+          customerId: customerId,
+          inflow30d: 0,
+          outflow30d: 0,
+          netCashflow30d: 0,
+          highRiskSpend30d: 0,
+          overdraftCount30d: 0,
+          inflowTxIds: [],
+          highRiskTxIds: [],
+          overdraftTxIds: [],
+          verifiedFacts: {},
+          connectedBankPeers: [],
+          peerLinkTxIds: {},
+          maxNetworkRiskScore: 0.0,
+          riskExposures: [],
+          lastUpdatedAt: new Date().toISOString()
+        };
+      }
+      return localState.customers[customerId];
+    }
+
+    function addLocalTrace(stage, fromComponent, toComponent, eventType, summary, details = {}) {
+      localState.seqNo += 1;
+      localState.workflowTraces.unshift({
+        sequenceNo: localState.seqNo,
+        stage,
+        fromComponent,
+        toComponent,
+        eventType,
+        summary,
+        details,
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    function localIngestRawTx(rawTx) {
+      const watchMap = {};
+      localState.watchlist.forEach(w => watchMap[w.entityId] = w);
+
+      const perspectives = [];
+      perspectives.push({
+        txId: rawTx.txId,
+        customerId: rawTx.fromCustomerId,
+        counterpartyId: rawTx.toCounterpartyId,
+        counterpartyIsBankClient: rawTx.counterpartyIsBankClient,
+        direction: "Outflow",
+        amount: Number(rawTx.amount),
+        currency: rawTx.currency || "EUR",
+        category: rawTx.category,
+        resultsInOverdraft: Boolean(rawTx.resultsInOverdraft),
+        restrictedTag: watchMap[rawTx.toCounterpartyId] || null
+      });
+
+      if (rawTx.counterpartyIsBankClient) {
+        perspectives.push({
+          txId: rawTx.txId,
+          customerId: rawTx.toCounterpartyId,
+          counterpartyId: rawTx.fromCustomerId,
+          counterpartyIsBankClient: true,
+          direction: "Inflow",
+          amount: Number(rawTx.amount),
+          currency: rawTx.currency || "EUR",
+          category: rawTx.category,
+          resultsInOverdraft: false,
+          restrictedTag: watchMap[rawTx.fromCustomerId] || null
+        });
+      }
+
+      addLocalTrace(
+        "FLINK_ENRICHMENT",
+        "Kafka(tx.raw.v1)",
+        "Flink(BilateralSplitter + WatchlistBroadcast)",
+        perspectives.length > 1 ? "BilateralSplit (2 Perspectives)" : "SinglePerspective",
+        `Flink enriched raw tx '${rawTx.txId}' (${rawTx.fromCustomerId} -> ${rawTx.toCounterpartyId}, ${rawTx.amount} EUR) into ${perspectives.length} sharded event(s)`,
+        {
+          txId: rawTx.txId,
+          perspectivesEmitted: perspectives.map(p => `${p.customerId}:${p.direction}`).join(", "),
+          watchlistHit: perspectives.find(p => p.restrictedTag)?.restrictedTag.entityId || "None"
+        }
+      );
+
+      perspectives.forEach(tx => {
+        if (tx.customerId.startsWith("EMPLOYER") || tx.customerId.startsWith("TECH-EMPLOYER")) return;
+
+        const c = ensureLocalCustomer(tx.customerId);
+        if (tx.direction === "Inflow") {
+          c.inflow30d += tx.amount;
+          c.inflowTxIds.unshift(tx.txId);
+        } else {
+          c.outflow30d += tx.amount;
+        }
+        c.netCashflow30d = c.inflow30d - c.outflow30d;
+
+        const isHighRisk = tx.direction === "Outflow" &&
+          (tx.category === "Gambling" || tx.category === "HighRiskTransfer" || tx.restrictedTag !== null);
+        if (isHighRisk) {
+          c.highRiskSpend30d += tx.amount;
+          c.highRiskTxIds.unshift(tx.txId);
+        }
+        if (tx.resultsInOverdraft) {
+          c.overdraftCount30d += 1;
+          c.overdraftTxIds.unshift(tx.txId);
+        }
+
+        if (tx.counterpartyIsBankClient && !tx.counterpartyId.startsWith("EMPLOYER") && !tx.counterpartyId.startsWith("TECH-EMPLOYER")) {
+          if (!c.connectedBankPeers.includes(tx.counterpartyId)) {
+            c.connectedBankPeers.push(tx.counterpartyId);
+          }
+          c.peerLinkTxIds[tx.counterpartyId] = c.peerLinkTxIds[tx.counterpartyId] || [];
+          if (!c.peerLinkTxIds[tx.counterpartyId].includes(tx.txId)) {
+            c.peerLinkTxIds[tx.counterpartyId].unshift(tx.txId);
+          }
+        }
+
+        addLocalTrace(
+          "PEKKO_SHARD_ACTOR",
+          "ShardRegion",
+          `CustomerAgent(${tx.customerId})`,
+          `IngestTransaction (${tx.direction})`,
+          `Routed ${tx.direction} transaction '${tx.txId}' (${tx.amount.toFixed(2)} EUR, ${tx.category}) to CustomerAgent(${tx.customerId})` +
+            (tx.restrictedTag ? ` [1st-Hop Watchlist Match: ${tx.restrictedTag.entityId}]` : ""),
+          {
+            txId: tx.txId,
+            customerId: tx.customerId,
+            counterpartyId: tx.counterpartyId,
+            amount: `${tx.amount.toFixed(2)} EUR`,
+            overdraft: String(tx.resultsInOverdraft)
+          }
+        );
+
+        if (tx.restrictedTag) {
+          const tag = tx.restrictedTag;
+          const directExp = {
+            exposureKey: `DIRECT:${tag.entityId}`,
+            sourceEntityId: tag.entityId,
+            intermediaryPeerId: null,
+            hopDistance: 1,
+            riskScore: tag.baseRiskWeight,
+            reasonCode: `RC_RESTRICTED_1HOP_${tag.level.toUpperCase()}`,
+            description: `Direct transaction (${tx.txId}) with restricted counterparty '${tag.entityId}' on ${tag.listSource} (${tag.reasonDescription})`,
+            evidenceIds: [tx.txId]
+          };
+          c.riskExposures = c.riskExposures.filter(e => e.exposureKey !== directExp.exposureKey);
+          c.riskExposures.push(directExp);
+          c.maxNetworkRiskScore = Math.max(c.maxNetworkRiskScore, directExp.riskScore);
+
+          c.connectedBankPeers.forEach(peerId => {
+            propagateLocalPeerSignal(c.customerId, peerId, tag, tx.txId, c.peerLinkTxIds[peerId] || []);
+          });
+        } else if (tx.counterpartyIsBankClient && !tx.counterpartyId.startsWith("TECH-EMPLOYER")) {
+          c.riskExposures.filter(e => e.hopDistance === 1).forEach(exp1 => {
+            const tag = watchMap[exp1.sourceEntityId] || {
+              entityId: exp1.sourceEntityId,
+              level: "SanctionedEntity",
+              baseRiskWeight: exp1.riskScore,
+              listSource: "WATCHLIST",
+              reasonDescription: exp1.description
+            };
+            propagateLocalPeerSignal(c.customerId, tx.counterpartyId, tag, exp1.evidenceIds[0], [tx.txId]);
+          });
+        }
+      });
+    }
+
+    function propagateLocalPeerSignal(fromId, targetId, tag, restrictedTxId, linkTxIds) {
+      const attenuatedScore = Number((tag.baseRiskWeight * 0.65).toFixed(2));
+      const signalId = `SIG-${restrictedTxId}-TO-${targetId}`;
+      const evidenceIds = [signalId, ...linkTxIds, restrictedTxId].filter((v, i, a) => a.indexOf(v) === i);
+
+      addLocalTrace(
+        "AGENT_TO_AGENT_IPC",
+        `CustomerAgent(${fromId})`,
+        `CustomerAgent(${targetId})`,
+        "PropagatePeerRisk (Hop=2)",
+        `Actor '${fromId}' propagated 2nd-hop risk signal '${signalId}' (attenuated score=${attenuatedScore.toFixed(2)}) to peer actor '${targetId}'`,
+        {
+          signalId,
+          originEntityId: tag.entityId,
+          hopCount: "2",
+          attenuatedRiskScore: attenuatedScore.toFixed(2),
+          rootEvidenceIds: evidenceIds.join(", ")
+        }
+      );
+
+      const peer = ensureLocalCustomer(targetId);
+      const peerExp = {
+        exposureKey: `PEER:${tag.entityId}:VIA:${fromId}`,
+        sourceEntityId: tag.entityId,
+        intermediaryPeerId: fromId,
+        hopDistance: 2,
+        riskScore: attenuatedScore,
+        reasonCode: "RC_302_INDIRECT_NETWORK_RISK_CONTAGION",
+        description: `2-hop risk exposure via connected client '${fromId}' (Peer '${fromId}' transacted (${restrictedTxId}) with restricted entity '${tag.entityId}' [${tag.listSource}: ${tag.reasonDescription}])`,
+        evidenceIds
+      };
+      peer.riskExposures = peer.riskExposures.filter(e => e.exposureKey !== peerExp.exposureKey);
+      peer.riskExposures.push(peerExp);
+      peer.maxNetworkRiskScore = Math.max(peer.maxNetworkRiskScore, attenuatedScore);
+    }
+
+    function localIngestDoc(customerId, docReq) {
+      const c = ensureLocalCustomer(customerId);
+      c.verifiedFacts[docReq.factType] = `${Number(docReq.numericValue || 0).toFixed(2)} (docId=${docReq.docId}, issuer=${docReq.issuer})`;
+      c.verifiedIncomeVal = docReq.factType === "VerifiedMonthlyNetIncome" ? Number(docReq.numericValue) : (c.verifiedIncomeVal || 0);
+      c.externalDebtVal = docReq.factType === "ExternalDebtObligation" ? Number(docReq.numericValue) : (c.externalDebtVal || 0);
+      c.incomeDocId = docReq.docId;
+
+      addLocalTrace(
+        "PEKKO_SHARD_ACTOR",
+        "ShardRegion",
+        `CustomerAgent(${customerId})`,
+        `IngestDocumentFact (${docReq.factType})`,
+        `Updated verified document '${docReq.docId}' (${docReq.factType} = ${docReq.numericValue} EUR) on CustomerAgent(${customerId})`,
+        { docId: docReq.docId, customerId, factType: docReq.factType, issuer: docReq.issuer }
+      );
+    }
+
+    function localEvaluateLoan(loanReq) {
+      const c = ensureLocalCustomer(loanReq.customerId);
+      const r = Number(loanReq.annualInterestRate) / 12.0;
+      const n = Number(loanReq.termMonths);
+      const amt = Number(loanReq.requestedAmount);
+      const factor = Math.pow(1 + r, n);
+      const installment = Number((amt * (r * factor) / (factor - 1)).toFixed(2));
+
+      const ruleTraces = [];
+      const adverseActionReasons = [];
+      let score = 750;
+
+      const income = c.verifiedIncomeVal || c.inflow30d;
+      const extDebt = c.externalDebtVal || 0;
+      const totalDebt = extDebt + installment;
+      const dti = income > 0 ? totalDebt / income : 9.99;
+
+      if (income <= 0) {
+        score -= 200;
+        const reqInc = (installment / 0.40).toFixed(2);
+        adverseActionReasons.push({
+          code: "RC_101_INSUFFICIENT_VERIFIED_INCOME",
+          title: "Unverified or Insufficient Monthly Income",
+          regulatoryStatement: "Unable to verify sufficient recurring monthly net income from submitted documents or 30-day account inflows.",
+          metricName: "VerifiedMonthlyIncome",
+          actualValue: `${income.toFixed(2)} EUR`,
+          thresholdValue: `> ${reqInc} EUR`,
+          evidenceIds: c.inflowTxIds.slice(0, 3),
+          counterfactualGuidance: `Provide a verified payslip or tax statement confirming monthly net income of at least ${reqInc} EUR.`,
+          isHardKnockout: true,
+          scorePenalty: 200
+        });
+        ruleTraces.push({ ruleId: "RULE_AFFORDABILITY_DTI", ruleName: "Debt-to-Income & Verified Affordability", passed: false, pointsDelta: -200 });
+      } else if (dti > 0.40) {
+        score -= 140;
+        const maxInst = Math.max(0, income * 0.40 - extDebt).toFixed(2);
+        const reqInc = (totalDebt / 0.40).toFixed(2);
+        adverseActionReasons.push({
+          code: "RC_102_EXCESSIVE_DEBT_TO_INCOME",
+          title: "Excessive Debt-to-Income Ratio",
+          regulatoryStatement: `Projected monthly debt obligations (${totalDebt.toFixed(2)} EUR including proposed installment of ${installment.toFixed(2)} EUR) represent ${(dti * 100).toFixed(1)}% of verified monthly income (${income.toFixed(2)} EUR), exceeding the maximum policy limit of 40.0%.`,
+          metricName: "DebtToIncomeRatio",
+          actualValue: `${(dti * 100).toFixed(1)}%`,
+          thresholdValue: "<= 40.0%",
+          evidenceIds: [c.incomeDocId || "DOC-INCOME", ...c.inflowTxIds.slice(0, 2)].filter(Boolean),
+          counterfactualGuidance: `Reduce the requested loan installment to at most ${maxInst} EUR/month (or increase verified net monthly income to ${reqInc} EUR).`,
+          isHardKnockout: false,
+          scorePenalty: 140
+        });
+        ruleTraces.push({ ruleId: "RULE_AFFORDABILITY_DTI", ruleName: "Debt-to-Income & Verified Affordability", passed: false, pointsDelta: -140 });
+      } else {
+        score += 25;
+        ruleTraces.push({ ruleId: "RULE_AFFORDABILITY_DTI", ruleName: "Debt-to-Income & Verified Affordability", passed: true, pointsDelta: 25 });
+      }
+
+      if (c.overdraftCount30d > 1) {
+        score -= 110;
+        adverseActionReasons.push({
+          code: "RC_201_RECENT_OVERDRAFT_EVENTS",
+          title: "Recent Account Overdraft Activity",
+          regulatoryStatement: `Account recorded ${c.overdraftCount30d} overdraft events in the last 30 days, exceeding the policy threshold of 1.`,
+          metricName: "Rolling30DayOverdraftCount",
+          actualValue: `${c.overdraftCount30d} overdrafts`,
+          thresholdValue: "<= 1 overdraft",
+          evidenceIds: c.overdraftTxIds,
+          counterfactualGuidance: "Maintain a positive account balance with at most 1 overdraft occurrence over a rolling 30-day period before re-applying.",
+          isHardKnockout: false,
+          scorePenalty: 110
+        });
+        ruleTraces.push({ ruleId: "RULE_LIQUIDITY_OVERDRAFT", ruleName: "Short-Term Liquidity & Overdraft Check", passed: false, pointsDelta: -110 });
+      } else {
+        score += 15;
+        ruleTraces.push({ ruleId: "RULE_LIQUIDITY_OVERDRAFT", ruleName: "Short-Term Liquidity & Overdraft Check", passed: true, pointsDelta: 15 });
+      }
+
+      const hrRatio = c.inflow30d > 0 ? c.highRiskSpend30d / c.inflow30d : (c.highRiskSpend30d > 0 ? 1.0 : 0.0);
+      if (hrRatio > 0.15) {
+        score -= 120;
+        adverseActionReasons.push({
+          code: "RC_204_HIGH_RISK_SPEND_VELOCITY",
+          title: "Elevated High-Risk or Speculative Outflow Velocity",
+          regulatoryStatement: `High-risk or gambling outflows over the past 30 days totaled ${c.highRiskSpend30d.toFixed(2)} EUR, representing ${(hrRatio * 100).toFixed(1)}% of 30-day inflows and exceeding the 15.0% policy limit.`,
+          metricName: "HighRiskSpendToInflowRatio30d",
+          actualValue: `${(hrRatio * 100).toFixed(1)}% (${c.highRiskSpend30d.toFixed(2)} EUR)`,
+          thresholdValue: "<= 15.0%",
+          evidenceIds: c.highRiskTxIds,
+          counterfactualGuidance: "Reduce speculative/high-risk outflows below 15.0% of monthly inflows over a 30-day rolling window.",
+          isHardKnockout: false,
+          scorePenalty: 120
+        });
+        ruleTraces.push({ ruleId: "RULE_HIGH_RISK_VELOCITY", ruleName: "30-Day High-Risk Outflow Velocity", passed: false, pointsDelta: -120 });
+      } else {
+        score += 10;
+        ruleTraces.push({ ruleId: "RULE_HIGH_RISK_VELOCITY", ruleName: "30-Day High-Risk Outflow Velocity", passed: true, pointsDelta: 10 });
+      }
+
+      const directExp = c.riskExposures.find(e => e.hopDistance === 1 && e.riskScore >= 0.50);
+      if (directExp) {
+        score -= 300;
+        adverseActionReasons.push({
+          code: "RC_301_DIRECT_RESTRICTED_COUNTERPARTY",
+          title: "Direct Transaction with Restricted or Watchlisted Third Party",
+          regulatoryStatement: `Real-time transaction history indicates direct financial interaction with restricted entity '${directExp.sourceEntityId}': ${directExp.description}.`,
+          metricName: "DirectCounterpartyRiskScore",
+          actualValue: `${directExp.riskScore.toFixed(2)} (1st-Hop Match: ${directExp.sourceEntityId})`,
+          thresholdValue: "< 0.50",
+          evidenceIds: directExp.evidenceIds,
+          counterfactualGuidance: `Compliance review required regarding transaction(s) ${directExp.evidenceIds.join(", ")} with restricted entity '${directExp.sourceEntityId}'.`,
+          isHardKnockout: true,
+          scorePenalty: 300
+        });
+        ruleTraces.push({ ruleId: "RULE_RESTRICTED_1HOP", ruleName: "1st-Hop Restricted Counterparty Screening", passed: false, pointsDelta: -300 });
+      } else {
+        ruleTraces.push({ ruleId: "RULE_RESTRICTED_1HOP", ruleName: "1st-Hop Restricted Counterparty Screening", passed: true, pointsDelta: 0 });
+      }
+
+      const peerExp = c.riskExposures.find(e => e.hopDistance >= 2 && e.riskScore >= 0.45);
+      if (peerExp) {
+        score -= 150;
+        adverseActionReasons.push({
+          code: "RC_302_INDIRECT_NETWORK_RISK_CONTAGION",
+          title: "Elevated Counterparty Network Risk Exposure (2nd-Hop Connection)",
+          regulatoryStatement: `Elevated risk contagion detected in active peer transaction network: ${peerExp.description} (attenuated network risk score ${peerExp.riskScore.toFixed(2)} exceeds threshold 0.45).`,
+          metricName: "PropagatedPeerNetworkRiskScore",
+          actualValue: `${peerExp.riskScore.toFixed(2)} (2-Hop via ${peerExp.intermediaryPeerId})`,
+          thresholdValue: "< 0.45",
+          evidenceIds: peerExp.evidenceIds,
+          counterfactualGuidance: `Risk score impacted by recent high-risk transfers with peer '${peerExp.intermediaryPeerId}' (evidence: ${peerExp.evidenceIds.join(", ")}). Cease transfers with flagged counterparties or request manual compliance clearance.`,
+          isHardKnockout: false,
+          scorePenalty: 150
+        });
+        ruleTraces.push({ ruleId: "RULE_NETWORK_CONTAGION_2HOP", ruleName: "2nd-Hop Ego-Network Risk Contagion", passed: false, pointsDelta: -150 });
+      } else {
+        ruleTraces.push({ ruleId: "RULE_NETWORK_CONTAGION_2HOP", ruleName: "2nd-Hop Ego-Network Risk Contagion", passed: true, pointsDelta: 0 });
+      }
+
+      const finalScore = Math.max(300, Math.min(850, score));
+      adverseActionReasons.sort((a, b) => (b.isHardKnockout - a.isHardKnockout) || (b.scorePenalty - a.scorePenalty));
+      const approved = adverseActionReasons.length === 0 && finalScore >= 620;
+
+      const decisionDto = {
+        applicationId: loanReq.applicationId,
+        customerId: loanReq.customerId,
+        status: approved ? "APPROVED" : "DENIED",
+        approvedAmount: approved ? amt : null,
+        monthlyInstallment: installment,
+        creditScore: finalScore,
+        minimumRequiredScore: 620,
+        policyVersion: "SA-CREDIT-POLICY-2026.11",
+        ruleTraces,
+        adverseActionReasons,
+        statementOfReasons: approved
+          ? `STATEMENT OF CREDIT DECISION (APPROVED)\nApplication ID : ${loanReq.applicationId}\nCustomer ID    : ${loanReq.customerId}\nDecision       : APPROVED for ${amt.toFixed(2)} EUR over ${n} months\nMonthly Payment: ${installment.toFixed(2)} EUR\nComposite Score: ${finalScore} / 850`
+          : `STATEMENT OF REASONS FOR CREDIT DENIAL (ADVERSE ACTION NOTICE)\nApplication ID : ${loanReq.applicationId}\nCustomer ID    : ${loanReq.customerId}\nDecision       : DENIED (${amt.toFixed(2)} EUR for ${n} months)\nComposite Score: ${finalScore} / 850 (Minimum Required: 620)`,
+        evaluatedAt: new Date().toISOString()
+      };
+
+      localState.recentDecisions.unshift(decisionDto);
+      addLocalTrace(
+        "EXPLAINABLE_ENGINE",
+        `CustomerAgent(${loanReq.customerId})`,
+        "ExplainableCreditEngine",
+        `LoanDecisionAudited (${decisionDto.status})`,
+        `Evaluated loan '${loanReq.applicationId}' (${amt.toFixed(2)} EUR): ${decisionDto.status} | Score: ${finalScore}/850` +
+          (adverseActionReasons.length > 0 ? ` | Reasons: ${adverseActionReasons.map(r => r.code).join(", ")}` : ""),
+        {
+          applicationId: loanReq.applicationId,
+          customerId: loanReq.customerId,
+          decision: decisionDto.status,
+          creditScore: `${finalScore} / 850`
+        }
+      );
+      return decisionDto;
+    }
+
+    async function refreshSystemOverview() {
+      const badge = document.getElementById("connectionBadge");
+      for (const candidate of CANDIDATE_BASES) {
+        try {
+          const res = await fetch(`${candidate}/api/v1/system/overview`);
+          if (res.ok) {
+            const data = await res.json();
+            if (data && Array.isArray(data.watchlist)) {
+              activeApiBase = candidate;
+              isBackendConnected = true;
+              badge.textContent = `● Live Pekko Cluster Connected (${candidate.replace('http://', '')})`;
+              badge.className = "px-2.5 py-1 rounded-md text-xs font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40";
+              renderSystemData(data);
+              return;
+            }
+          }
+        } catch (_) {}
+      }
+
+      isBackendConnected = false;
+      badge.textContent = "● Interactive In-Browser Pekko Simulation Active";
+      badge.className = "px-2.5 py-1 rounded-md text-xs font-semibold bg-[var(--secondary)] text-[var(--secondary-foreground)] border border-[var(--border)]";
+      renderSystemData({
+        activeCustomerIds: Object.keys(localState.customers),
+        customers: Object.values(localState.customers),
+        watchlist: localState.watchlist,
+        workflowTraces: localState.workflowTraces,
+        recentDecisions: localState.recentDecisions
+      });
+    }
+
+    window.triggerScenarioStep = async function(stepName) {
+      // Highlight clicked step button
+      ["btn-step1", "btn-step2", "btn-step3", "btn-step4"].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.classList.remove("step-card-active");
+      });
+      const stepBtnMap = {
+        "step1-bootstrap": "btn-step1",
+        "step2-alice-healthy-loan": "btn-step2",
+        "step3-bob-sanction-contagion": "btn-step3",
+        "step4-alice-distress-loan": "btn-step4"
+      };
+      if (stepBtnMap[stepName]) {
+        const activeBtn = document.getElementById(stepBtnMap[stepName]);
+        if (activeBtn) activeBtn.classList.add("step-card-active");
+      }
+
+      showActionFeedback(`Executing ${stepName}...`);
+
+      if (isBackendConnected) {
+        try {
+          const res = await fetch(`${activeApiBase}/api/v1/demo/scenario/${stepName}`, { method: "POST" });
+          if (res.ok) {
+            const body = await res.json();
+            if (stepName === "step2-alice-healthy-loan" || stepName === "step4-alice-distress-loan") {
+              selectedCustomerId = "CUST-ALICE-001";
+              selectedDecisionIdx = 0;
+            } else if (stepName === "step3-bob-sanction-contagion") {
+              selectedCustomerId = "CUST-BOB-002";
+              selectedDecisionIdx = 0;
+            }
+            showActionFeedback(body.message || `Completed ${stepName}`);
+            await refreshSystemOverview();
+            return;
+          }
+        } catch (_) {}
+      }
+
+      // Fallback execution in local state
+      if (stepName === "step0-reset") {
+        localState = createInitialLocalState();
+      } else if (stepName === "step1-bootstrap") {
+        localIngestDoc("CUST-ALICE-001", { docId: "DOC-PAYSLIP-ALICE-01", factType: "VerifiedMonthlyNetIncome", numericValue: 4200, issuer: "National Tax & Payroll Registry" });
+        localIngestDoc("CUST-BOB-002", { docId: "DOC-PAYSLIP-BOB-01", factType: "VerifiedMonthlyNetIncome", numericValue: 3500, issuer: "National Tax & Payroll Registry" });
+        localIngestRawTx({ txId: "TX-SAL-ALICE-01", fromCustomerId: "TECH-EMPLOYER-AG", toCounterpartyId: "CUST-ALICE-001", counterpartyIsBankClient: true, amount: 4200, currency: "EUR", category: "Salary", resultsInOverdraft: false });
+        localIngestRawTx({ txId: "TX-RENT-ALICE-01", fromCustomerId: "CUST-ALICE-001", toCounterpartyId: "METRO-HOUSING-LTD", counterpartyIsBankClient: false, amount: 1100, currency: "EUR", category: "Housing", resultsInOverdraft: false });
+        localIngestRawTx({ txId: "TX-PEER-ALICE-BOB-101", fromCustomerId: "CUST-ALICE-001", toCounterpartyId: "CUST-BOB-002", counterpartyIsBankClient: true, amount: 500, currency: "EUR", category: "PeerTransfer", resultsInOverdraft: false });
+        showActionFeedback("Step 1 complete: Alice & Bob profiles hydrated with bilateral link TX-PEER-ALICE-BOB-101.");
+      } else if (stepName === "step2-alice-healthy-loan") {
+        localEvaluateLoan({ applicationId: "LOAN-ALICE-HEALTHY-01", customerId: "CUST-ALICE-001", requestedAmount: 12000, termMonths: 24, annualInterestRate: 0.065 });
+        selectedCustomerId = "CUST-ALICE-001";
+        selectedDecisionIdx = 0;
+        showActionFeedback("Step 2 complete: Alice's initial 12,000 EUR loan APPROVED (Score 800/850).");
+      } else if (stepName === "step3-bob-sanction-contagion") {
+        localIngestRawTx({ txId: "TX-SANCTION-BOB-999", fromCustomerId: "CUST-BOB-002", toCounterpartyId: "ENTITY-SHADOW-LTD", counterpartyIsBankClient: false, amount: 4800, currency: "EUR", category: "HighRiskTransfer", resultsInOverdraft: false });
+        localEvaluateLoan({ applicationId: "LOAN-BOB-DENIED-01", customerId: "CUST-BOB-002", requestedAmount: 10000, termMonths: 24, annualInterestRate: 0.065 });
+        selectedCustomerId = "CUST-BOB-002";
+        selectedDecisionIdx = 0;
+        showActionFeedback("Step 3 complete: Bob's 1st-hop restricted hit triggered 2nd-hop PeerRiskSignal to Alice!");
+      } else if (stepName === "step4-alice-distress-loan") {
+        localIngestRawTx({ txId: "TX-GAMB-ALICE-201", fromCustomerId: "CUST-ALICE-001", toCounterpartyId: "CASINO-ROYALE-BET", counterpartyIsBankClient: false, amount: 600, currency: "EUR", category: "Gambling", resultsInOverdraft: true });
+        localIngestRawTx({ txId: "TX-GAMB-ALICE-202", fromCustomerId: "CUST-ALICE-001", toCounterpartyId: "CASINO-ROYALE-BET", counterpartyIsBankClient: false, amount: 500, currency: "EUR", category: "Gambling", resultsInOverdraft: true });
+        localEvaluateLoan({ applicationId: "LOAN-ALICE-CONTAGION-02", customerId: "CUST-ALICE-001", requestedAmount: 18000, termMonths: 24, annualInterestRate: 0.065 });
+        selectedCustomerId = "CUST-ALICE-001";
+        selectedDecisionIdx = 0;
+        showActionFeedback("Step 4 complete: Alice's 18,000 EUR loan DENIED (395/850) with 2nd-hop contagion & overdraft reasons.");
+      }
+      await refreshSystemOverview();
+    };
+
+    window.runFullGuidedDemo = async function() {
+      await window.resetSimulationState();
+      await new Promise(r => setTimeout(r, 400));
+      await window.triggerScenarioStep("step3-bob-sanction-contagion");
+      await new Promise(r => setTimeout(r, 400));
+      await window.triggerScenarioStep("step4-alice-distress-loan");
+    };
+
+    window.resetSimulationState = async function() {
+      localState = createInitialLocalState();
+      selectedCustomerId = "CUST-ALICE-001";
+      selectedDecisionIdx = 0;
+      if (isBackendConnected) {
+        try {
+          await fetch(`${activeApiBase}/api/v1/demo/scenario/step0-reset`, { method: "POST" });
+        } catch (_) {}
+      }
+      await window.triggerScenarioStep("step1-bootstrap");
+      await window.triggerScenarioStep("step2-alice-healthy-loan");
+      showActionFeedback("Workbench reset to clean baseline (Step 1 + Step 2).");
+    };
+
+    let currentOverviewData = null;
+
+    function renderSystemData(data) {
+      currentOverviewData = data;
+
+      const wlContainer = document.getElementById("watchlistPills");
+      wlContainer.innerHTML = (data.watchlist || []).map(w =>
+        `<span class="px-2 py-0.5 rounded text-xs font-medium bg-rose-500/20 text-rose-400 border border-rose-500/30">${w.entityId} (${w.level})</span>`
+      ).join("");
+
+      const customers = data.customers || [];
+      document.getElementById("activeAgentCountBadge").textContent = `${customers.length} Active Shards`;
+
+      const agentContainer = document.getElementById("agentCardsContainer");
+      if (customers.length === 0) {
+        agentContainer.innerHTML = `<div class="col-span-2 p-4 rounded-lg border border-dashed border-[var(--border)] text-center text-xs text-[var(--muted-foreground)]">No active CustomerAgents yet. Click <strong>Step 1</strong> or <strong>Run Full Guided Demo</strong> above.</div>`;
+      } else {
+        if (!customers.some(c => c.customerId === selectedCustomerId)) {
+          selectedCustomerId = customers[0].customerId;
+        }
+        agentContainer.innerHTML = customers.map(c => {
+          const has1Hop = (c.riskExposures || []).some(e => e.hopDistance === 1);
+          const has2Hop = (c.riskExposures || []).some(e => e.hopDistance >= 2);
+          const isSelected = c.customerId === selectedCustomerId;
+          const statusDot = has1Hop ? "bg-rose-500" : (has2Hop || c.overdraftCount30d > 1 ? "bg-amber-500" : "bg-emerald-500");
+          const borderClass = isSelected ? "border-2 border-blue-500" : "border border-[var(--border)]";
+
+          return `
+            <div onclick="window.selectCustomerAgent('${c.customerId}')" class="cursor-pointer p-3 rounded-xl bg-[var(--card)] ${borderClass} hover:opacity-95 transition">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                  <span class="w-2.5 h-2.5 rounded-full ${statusDot}"></span>
+                  <span class="text-xs font-bold">${c.customerId}</span>
+                </div>
+                <span class="text-xs px-1.5 py-0.5 rounded bg-[var(--secondary)] text-[var(--secondary-foreground)]">
+                  Shard #${Math.abs(hashCode(c.customerId) % 100)}
+                </span>
+              </div>
+              <div class="grid grid-cols-2 gap-1.5 mt-2.5 text-xs">
+                <div class="p-1.5 rounded bg-[var(--background)]">
+                  <div class="text-[var(--muted-foreground)]">30d Inflow</div>
+                  <div class="font-semibold text-emerald-400">${Number(c.inflow30d).toFixed(0)} EUR</div>
+                </div>
+                <div class="p-1.5 rounded bg-[var(--background)]">
+                  <div class="text-[var(--muted-foreground)]">30d Outflow</div>
+                  <div class="font-semibold">${Number(c.outflow30d).toFixed(0)} EUR</div>
+                </div>
+              </div>
+              <div class="mt-2 flex items-center justify-between text-xs text-[var(--muted-foreground)]">
+                <span>Peers: ${(c.connectedBankPeers || []).length}</span>
+                <span>Risk Score: <strong>${Number(c.maxNetworkRiskScore).toFixed(2)}</strong></span>
+              </div>
+            </div>
+          `;
+        }).join("");
+      }
+
+      const ipcTraces = (data.workflowTraces || []).filter(t => t.stage === "AGENT_TO_AGENT_IPC");
+      const ipcContent = document.getElementById("ipcSignalContent");
+      if (ipcTraces.length > 0) {
+        const latestIpc = ipcTraces[0];
+        ipcContent.innerHTML = `
+          <div class="flex flex-wrap items-center gap-1.5 text-xs font-semibold text-amber-400">
+            <span>&#9889; ${latestIpc.fromComponent}</span>
+            <span>&mdash;[ ${latestIpc.eventType} ]&rarr;</span>
+            <span>${latestIpc.toComponent}</span>
+          </div>
+          <div class="text-xs text-[var(--muted-foreground)] mt-1">${latestIpc.summary}</div>
+        `;
+      } else {
+        ipcContent.innerHTML = `No 2nd-hop <code class="text-xs">PeerRiskSignal</code> messages propagated yet. Run <strong>Step 3</strong> or inject a restricted transaction to observe actor-to-actor risk contagion.`;
+      }
+
+      const dropdown = document.getElementById("agentSelectDropdown");
+      dropdown.innerHTML = customers.map(c =>
+        `<option value="${c.customerId}" ${c.customerId === selectedCustomerId ? "selected" : ""}>${c.customerId}</option>`
+      ).join("");
+
+      renderSelectedAgentInspector();
+      renderDecisionViewer();
+      window.renderWorkflowTraces();
+    }
+
+    window.selectCustomerAgent = function(customerId) {
+      selectedCustomerId = customerId;
+      document.getElementById("loanCustomerId").value = customerId;
+      document.getElementById("docCustomerId").value = customerId;
+      showActionFeedback(`Inspecting CustomerAgent(${customerId})`);
+      if (currentOverviewData) {
+        renderSystemData(currentOverviewData);
+      }
+    };
+
+    function renderSelectedAgentInspector() {
+      const customers = (currentOverviewData && currentOverviewData.customers) || [];
+      const agent = customers.find(c => c.customerId === selectedCustomerId);
+      document.getElementById("selectedAgentTitle").textContent = `CustomerAgent(${selectedCustomerId})`;
+
+      if (!agent) {
+        document.getElementById("agentMetricsGrid").innerHTML = `<div class="col-span-4 text-xs text-[var(--muted-foreground)]">No state loaded for ${selectedCustomerId}.</div>`;
+        return;
+      }
+
+      const inflow = Number(agent.inflow30d);
+      const outflow = Number(agent.outflow30d);
+      const hrSpend = Number(agent.highRiskSpend30d);
+      const hrRatio = inflow > 0 ? ((hrSpend / inflow) * 100).toFixed(1) : (hrSpend > 0 ? "100.0" : "0.0");
+
+      document.getElementById("agentMetricsGrid").innerHTML = `
+        <div class="p-3 rounded-lg border border-[var(--border)] bg-[var(--background)]">
+          <div class="text-xs text-[var(--muted-foreground)]">30d Total Inflow</div>
+          <div class="text-sm font-bold mt-0.5 text-emerald-400">${inflow.toFixed(2)} EUR</div>
+        </div>
+        <div class="p-3 rounded-lg border border-[var(--border)] bg-[var(--background)]">
+          <div class="text-xs text-[var(--muted-foreground)]">30d Total Outflow</div>
+          <div class="text-sm font-bold mt-0.5">${outflow.toFixed(2)} EUR</div>
+        </div>
+        <div class="p-3 rounded-lg border border-[var(--border)] bg-[var(--background)]">
+          <div class="text-xs text-[var(--muted-foreground)]">High-Risk Velocity</div>
+          <div class="text-sm font-bold mt-0.5 ${Number(hrRatio) > 15 ? 'text-rose-400' : ''}">${hrRatio}% (${hrSpend.toFixed(0)} EUR)</div>
+        </div>
+        <div class="p-3 rounded-lg border border-[var(--border)] bg-[var(--background)]">
+          <div class="text-xs text-[var(--muted-foreground)]">30d Overdrafts</div>
+          <div class="text-sm font-bold mt-0.5 ${agent.overdraftCount30d > 1 ? 'text-rose-400' : ''}">${agent.overdraftCount30d} (Limit &le; 1)</div>
+        </div>
+      `;
+
+      const factsEntries = Object.entries(agent.verifiedFacts || {});
+      document.getElementById("agentDocsList").innerHTML = factsEntries.length === 0
+        ? `<div class="text-[var(--muted-foreground)]">No verified external documents ingested yet.</div>`
+        : factsEntries.map(([k, v]) => `
+            <div class="p-2 rounded bg-[var(--card)] border border-[var(--border)]">
+              <div class="font-semibold text-blue-400">${k}</div>
+              <div class="text-[var(--muted-foreground)] mt-0.5">${v}</div>
+            </div>
+          `).join("");
+
+      const peers = agent.connectedBankPeers || [];
+      document.getElementById("agentPeersList").innerHTML = peers.length === 0
+        ? `<div class="text-[var(--muted-foreground)]">No peer bank clients connected in Ego-Network.</div>`
+        : peers.map(peerId => `
+            <div onclick="window.selectCustomerAgent('${peerId}')" class="cursor-pointer p-2 rounded bg-[var(--card)] border border-[var(--border)] flex items-center justify-between hover:border-blue-500">
+              <span class="font-semibold">&#128279; ${peerId}</span>
+              <span class="text-blue-400">Inspect Peer &rarr;</span>
+            </div>
+          `).join("");
+
+      document.getElementById("agentMaxRiskBadge").textContent = `Max Network Risk: ${Number(agent.maxNetworkRiskScore).toFixed(2)}`;
+      const exposures = agent.riskExposures || [];
+      document.getElementById("agentRiskExposuresList").innerHTML = exposures.length === 0
+        ? `<div class="text-[var(--muted-foreground)]">Zero 1st-hop or 2nd-hop restricted exposures detected.</div>`
+        : exposures.map(exp => `
+            <div class="p-2.5 rounded-lg bg-[var(--card)] border border-[var(--border)]">
+              <div class="flex items-center justify-between">
+                <span class="font-bold ${exp.hopDistance === 1 ? 'text-rose-400' : 'text-amber-400'}">
+                  [${exp.hopDistance}-HOP EXPOSURE] ${exp.reasonCode}
+                </span>
+                <span class="font-semibold">Score: ${Number(exp.riskScore).toFixed(2)}</span>
+              </div>
+              <div class="text-[var(--muted-foreground)] mt-1">${exp.description}</div>
+              <div class="mt-1 text-[var(--muted-foreground)]">
+                <strong>Evidence Chain:</strong> <code class="text-xs">${(exp.evidenceIds || []).join(" -> ")}</code>
+              </div>
+            </div>
+          `).join("");
+    }
+
+    window.selectDecisionByIndex = function(idx) {
+      selectedDecisionIdx = Number(idx);
+      renderDecisionViewer();
+    };
+
+    function renderDecisionViewer() {
+      const decisions = (currentOverviewData && currentOverviewData.recentDecisions) || [];
+      const historyDropdown = document.getElementById("decisionHistoryDropdown");
+      historyDropdown.innerHTML = decisions.length === 0
+        ? `<option value="0">No evaluations yet</option>`
+        : decisions.map((d, idx) =>
+            `<option value="${idx}" ${idx === selectedDecisionIdx ? "selected" : ""}>${d.applicationId} (${d.customerId}) — ${d.status}</option>`
+          ).join("");
+
+      const container = document.getElementById("decisionViewerContainer");
+      if (decisions.length === 0) {
+        container.innerHTML = `<div class="p-4 rounded-lg border border-dashed border-[var(--border)] text-xs text-[var(--muted-foreground)] text-center">No loan applications evaluated yet. Click <strong>Step 2</strong> or submit a loan request on the left.</div>`;
+        return;
+      }
+
+      const d = decisions[selectedDecisionIdx] || decisions[0];
+      const isApproved = d.status === "APPROVED";
+      const statusBadge = isApproved
+        ? `<span class="px-2.5 py-1 rounded-md text-xs font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40">APPROVED</span>`
+        : `<span class="px-2.5 py-1 rounded-md text-xs font-bold bg-rose-500/20 text-rose-400 border border-rose-500/40">DENIED (ADVERSE ACTION)</span>`;
+
+      const rulesHtml = (d.ruleTraces || []).map(r => `
+        <div class="flex items-center justify-between py-1.5 px-2.5 rounded bg-[var(--background)] border border-[var(--border)] text-xs">
+          <div class="flex items-center gap-2">
+            <span class="${r.passed ? 'text-emerald-400' : 'text-rose-400'} font-bold">${r.passed ? '&#10003;' : '&#10007;'}</span>
+            <span class="font-medium">${r.ruleName}</span>
+          </div>
+          <span class="font-mono font-semibold ${r.pointsDelta >= 0 ? 'text-emerald-400' : 'text-rose-400'}">
+            ${r.pointsDelta >= 0 ? '+' + r.pointsDelta : r.pointsDelta} pts
+          </span>
+        </div>
+      `).join("");
+
+      const reasonsHtml = (d.adverseActionReasons || []).map((rc, i) => `
+        <div class="p-3 rounded-lg bg-[var(--background)] border border-rose-500/40 space-y-1 text-xs">
+          <div class="flex items-center justify-between">
+            <span class="font-bold text-rose-400">${i + 1}. [${rc.code}] ${rc.title}</span>
+            <span class="px-1.5 py-0.5 rounded bg-[var(--secondary)] text-xs">${rc.isHardKnockout ? 'HARD KNOCKOUT' : '-' + rc.scorePenalty + ' pts'}</span>
+          </div>
+          <p class="text-[var(--foreground)]">${rc.regulatoryStatement}</p>
+          <div class="text-[var(--muted-foreground)]">
+            <strong>Metric:</strong> ${rc.metricName} | <strong>Actual:</strong> ${rc.actualValue} | <strong>Required:</strong> ${rc.thresholdValue}
+          </div>
+          <div class="text-[var(--muted-foreground)]">
+            <strong>Evidence IDs:</strong> <code class="text-xs">${(rc.evidenceIds || []).join(", ")}</code>
+          </div>
+          <div class="pt-1 text-blue-400 font-medium">
+            <strong>Counterfactual Resolution:</strong> ${rc.counterfactualGuidance}
+          </div>
+        </div>
+      `).join("");
+
+      container.innerHTML = `
+        <div class="p-3.5 rounded-xl bg-[var(--background)] border border-[var(--border)] flex items-center justify-between">
+          <div>
+            <div class="text-xs text-[var(--muted-foreground)]">Application <code class="text-xs">${d.applicationId}</code> &bull; Client <code class="text-xs">${d.customerId}</code></div>
+            <div class="text-base font-bold mt-0.5">Composite Credit Score: ${d.creditScore} / 850 <span class="text-xs font-normal text-[var(--muted-foreground)]">(Min: ${d.minimumRequiredScore})</span></div>
+          </div>
+          ${statusBadge}
+        </div>
+
+        <div class="mt-3">
+          <div class="text-xs font-semibold text-[var(--muted-foreground)] mb-1.5">Deterministic Scorecard Evaluation Trace:</div>
+          <div class="space-y-1.5">${rulesHtml}</div>
+        </div>
+
+        ${reasonsHtml ? `
+          <div class="mt-3">
+            <div class="text-xs font-semibold text-rose-400 mb-1.5">Principal Adverse Action Reasons (Legally Binding Statement):</div>
+            <div class="space-y-2">${reasonsHtml}</div>
+          </div>
+        ` : `
+          <div class="mt-3 p-3 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-xs text-emerald-400">
+            All real-time cashflow, affordability, and 1st/2nd-hop counterparty network checks passed. Monthly Installment: <strong>${Number(d.monthlyInstallment).toFixed(2)} EUR</strong>.
+          </div>
+        `}
+      `;
+    }
+
+    window.renderWorkflowTraces = function() {
+      const filter = document.getElementById("traceFilterSelect").value;
+      const allTraces = (currentOverviewData && currentOverviewData.workflowTraces) || [];
+      const traces = filter === "ALL" ? allTraces : allTraces.filter(t => t.stage === filter);
+
+      const container = document.getElementById("workflowTraceContainer");
+      if (traces.length === 0) {
+        container.innerHTML = `<div class="p-4 rounded-lg border border-dashed border-[var(--border)] text-xs text-[var(--muted-foreground)] text-center">No workflow events recorded for this filter.</div>`;
+        return;
+      }
+
+      container.innerHTML = traces.map(t => {
+        const badgeColor =
+          t.stage === "AGENT_TO_AGENT_IPC" ? "bg-amber-500/20 text-amber-400 border border-amber-500/40" :
+          t.stage === "FLINK_ENRICHMENT" ? "bg-sky-500/20 text-sky-400 border border-sky-500/40" :
+          t.stage === "EXPLAINABLE_ENGINE" ? "bg-purple-500/20 text-purple-400 border border-purple-500/40" :
+          "bg-[var(--secondary)] text-[var(--secondary-foreground)]";
+
+        return `
+          <div class="p-3 rounded-lg bg-[var(--background)] border border-[var(--border)] text-xs space-y-1">
+            <div class="flex items-center justify-between gap-2">
+              <span class="px-2 py-0.5 rounded font-semibold ${badgeColor}">#${t.sequenceNo} &bull; ${t.stage}</span>
+              <span class="text-[var(--muted-foreground)] font-mono">${t.eventType}</span>
+            </div>
+            <div class="font-semibold text-[var(--foreground)]">
+              ${t.fromComponent} &rarr; ${t.toComponent}
+            </div>
+            <div class="text-[var(--muted-foreground)]">${t.summary}</div>
+          </div>
+        `;
+      }).join("");
+    };
+
+    window.switchPlaygroundTab = function(tab) {
+      ["loan", "tx", "doc"].forEach(t => {
+        const panel = document.getElementById(`playground-tab-${t}`);
+        const btn = document.getElementById(`tab-btn-${t}`);
+        if (t === tab) {
+          panel.classList.remove("hidden");
+          btn.className = "px-3 py-1.5 font-semibold bg-blue-600 text-white";
+        } else {
+          panel.classList.add("hidden");
+          btn.className = "px-3 py-1.5 font-medium bg-[var(--background)] text-[var(--foreground)]";
+        }
+      });
+    };
+
+    window.fillLoanPreset = function(customerId, amount, term) {
+      document.getElementById("loanCustomerId").value = customerId;
+      document.getElementById("loanAmount").value = amount;
+      document.getElementById("loanTerm").value = term;
+      document.getElementById("loanAppId").value = `LOAN-${customerId.split('-')[1] || 'APP'}-${Math.floor(100 + Math.random() * 899)}`;
+      showActionFeedback(`Loaded preset for ${customerId}: ${amount} EUR over ${term}m`);
+    };
+
+    window.fillTxPreset = function(fromId, toId, amount, category, isClient, overdraft) {
+      txSeqCounter += 1;
+      document.getElementById("txIdInput").value = `TX-LIVE-${txSeqCounter}`;
+      document.getElementById("txFromInput").value = fromId;
+      document.getElementById("txToInput").value = toId;
+      document.getElementById("txAmountInput").value = amount;
+      document.getElementById("txCategoryInput").value = category;
+      document.getElementById("txIsBankClientInput").checked = isClient;
+      document.getElementById("txOverdraftInput").checked = overdraft;
+      showActionFeedback(`Loaded transaction preset: ${fromId} -> ${toId} (${amount} EUR)`);
+    };
+
+    window.submitCustomLoanRequest = async function() {
+      const payload = {
+        applicationId: document.getElementById("loanAppId").value.trim(),
+        customerId: document.getElementById("loanCustomerId").value.trim(),
+        requestedAmount: Number(document.getElementById("loanAmount").value),
+        termMonths: Number(document.getElementById("loanTerm").value),
+        annualInterestRate: Number(document.getElementById("loanRate").value)
+      };
+      selectedCustomerId = payload.customerId;
+      selectedDecisionIdx = 0;
+
+      let handledByServer = false;
+      if (isBackendConnected) {
+        try {
+          const res = await fetch(`${activeApiBase}/api/v1/loans/evaluate`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          if (res.ok) handledByServer = true;
+        } catch (_) {}
+      }
+      if (!handledByServer) {
+        localEvaluateLoan(payload);
+      }
+      showActionFeedback(`Evaluated loan ${payload.applicationId} for ${payload.customerId}`);
+      document.getElementById("loanAppId").value = `LOAN-CUSTOM-${Math.floor(100 + Math.random() * 899)}`;
+      await refreshSystemOverview();
+    };
+
+    window.submitCustomTransaction = async function() {
+      const payload = {
+        txId: document.getElementById("txIdInput").value.trim(),
+        fromCustomerId: document.getElementById("txFromInput").value.trim(),
+        toCounterpartyId: document.getElementById("txToInput").value.trim(),
+        counterpartyIsBankClient: document.getElementById("txIsBankClientInput").checked,
+        amount: Number(document.getElementById("txAmountInput").value),
+        currency: "EUR",
+        category: document.getElementById("txCategoryInput").value,
+        resultsInOverdraft: document.getElementById("txOverdraftInput").checked
+      };
+      selectedCustomerId = payload.fromCustomerId;
+
+      let handledByServer = false;
+      if (isBackendConnected) {
+        try {
+          const res = await fetch(`${activeApiBase}/api/v1/transactions/ingest`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          if (res.ok) handledByServer = true;
+        } catch (_) {}
+      }
+      if (!handledByServer) {
+        localIngestRawTx(payload);
+      }
+      showActionFeedback(`Ingested transaction ${payload.txId} (${payload.fromCustomerId} -> ${payload.toCounterpartyId})`);
+      txSeqCounter += 1;
+      document.getElementById("txIdInput").value = `TX-LIVE-${txSeqCounter}`;
+      await refreshSystemOverview();
+    };
+
+    window.submitCustomDocumentFact = async function() {
+      const customerId = document.getElementById("docCustomerId").value.trim();
+      const payload = {
+        docId: document.getElementById("docIdInput").value.trim(),
+        factType: document.getElementById("docFactTypeInput").value,
+        numericValue: Number(document.getElementById("docNumericInput").value),
+        textValue: "Verified via Interactive Workbench",
+        issuer: "National Tax & Payroll Registry"
+      };
+      selectedCustomerId = customerId;
+
+      let handledByServer = false;
+      if (isBackendConnected) {
+        try {
+          const res = await fetch(`${activeApiBase}/api/v1/customers/${customerId}/documents`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          if (res.ok) handledByServer = true;
+        } catch (_) {}
+      }
+      if (!handledByServer) {
+        localIngestDoc(customerId, payload);
+      }
+      showActionFeedback(`Uploaded verified document ${payload.docId} for ${customerId}`);
+      await refreshSystemOverview();
+    };
+
+    function hashCode(str) {
+      let h = 0;
+      for (let i = 0; i < str.length; i++) {
+        h = (Math.imul(31, h) + str.charCodeAt(i)) | 0;
+      }
+      return h;
+    }
+
+    window.addEventListener("DOMContentLoaded", async () => {
+      await refreshSystemOverview();
+      if (!currentOverviewData || (currentOverviewData.customers || []).length === 0) {
+        await window.triggerScenarioStep("step1-bootstrap");
+        await window.triggerScenarioStep("step2-alice-healthy-loan");
+      }
+    });
+  </script>
+</body>
+</html>

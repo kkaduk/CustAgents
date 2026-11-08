@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+package com.bank.sa.proto.v1;
+
+option java_multiple_files = true;
+option java_package = "com.bank.sa.proto.v1";
+
+// gRPC Service for Real-Time Loan Origination & Customer Situation Awareness
+service LoanOriginationService {
+  // Evaluates a consumer loan request against the customer's live sharded actor state (<15ms p99)
+  rpc EvaluateLoan (EvaluateLoanRpcRequest) returns (EvaluateLoanRpcResponse);
+
+  // Retrieves a real-time Level-2 Situation Awareness snapshot for a customer
+  rpc GetCustomerSituation (GetCustomerSituationRpcRequest) returns (CustomerSituationRpcResponse);
+
+  // Ingests a verified document fact (e.g., payslip, tax return, external debt)
+  rpc IngestDocumentFact (IngestDocumentFactRpcRequest) returns (IngestionAckRpcResponse);
+}
+
+message EvaluateLoanRpcRequest {
+  string application_id = 1;
+  string customer_id = 2;
+  string requested_amount = 3;
+  int32 term_months = 4;
+  string annual_interest_rate = 5;
+  string requested_at_iso = 6;
+}
+
+message ReasonCodeRpc {
+  string code = 1;
+  string title = 2;
+  string regulatory_statement = 3;
+  string metric_name = 4;
+  string actual_value = 5;
+  string threshold_value = 6;
+  repeated string evidence_ids = 7;
+  string counterfactual_guidance = 8;
+  bool is_hard_knockout = 9;
+  int32 score_penalty = 10;
+}
+
+message EvaluateLoanRpcResponse {
+  string application_id = 1;
+  string customer_id = 2;
+  string status = 3; // "APPROVED" or "DENIED"
+  int32 credit_score = 4;
+  int32 minimum_required_score = 5;
+  string monthly_installment = 6;
+  string policy_version = 7;
+  repeated ReasonCodeRpc adverse_action_reasons = 8;
+  string statement_of_reasons = 9;
+  string evaluated_at_iso = 10;
+}
+
+message GetCustomerSituationRpcRequest {
+  string customer_id = 1;
+}
+
+message CustomerSituationRpcResponse {
+  string customer_id = 1;
+  string inflow_30d = 2;
+  string outflow_30d = 3;
+  string high_risk_spend_30d = 4;
+  int32 overdraft_count_30d = 5;
+  double max_network_risk_score = 6;
+  repeated string connected_bank_peers = 7;
+  int32 active_risk_exposures_count = 8;
+}
+
+message IngestDocumentFactRpcRequest {
+  string doc_id = 1;
+  string customer_id = 2;
+  string fact_type = 3;
+  string numeric_value = 4;
+  string text_value = 5;
+  string issuer = 6;
+}
+
+message IngestionAckRpcResponse {
+  string customer_id = 1;
+  string reference_id = 2;
+  string status = 3;
+}
+
