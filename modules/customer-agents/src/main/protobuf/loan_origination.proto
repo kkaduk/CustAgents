@@ -5,15 +5,19 @@ package com.bank.sa.proto.v1;
 option java_multiple_files = true;
 option java_package = "com.bank.sa.proto.v1";
 
-// gRPC Service for Real-Time Loan Origination & Customer Situation Awareness
+// gRPC Service for Real-Time Loan Origination, Level-3 Situation Projection & Customer Situation Awareness
 service LoanOriginationService {
+  // Computes a Level-3 Situation Projection (Future DTI, Expected Liquidity, Risk Exposure, Affordability)
+  // independently of formal credit decision approval (Section 7 of Doc/ExaPekdoDesign.md)
+  rpc ProjectLoan (EvaluateLoanRpcRequest) returns (SituationProjectionRpcResponse);
+
   // Evaluates a consumer loan request against the customer's live sharded actor state (<15ms p99)
   rpc EvaluateLoan (EvaluateLoanRpcRequest) returns (EvaluateLoanRpcResponse);
 
   // Retrieves a real-time Level-2 Situation Awareness snapshot for a customer
   rpc GetCustomerSituation (GetCustomerSituationRpcRequest) returns (CustomerSituationRpcResponse);
 
-  // Ingests a verified document fact (e.g., payslip, tax return, external debt)
+  // Ingests a verified document fact via DocumentVerificationAgent (payslip, tax return, external debt)
   rpc IngestDocumentFact (IngestDocumentFactRpcRequest) returns (IngestionAckRpcResponse);
 }
 
@@ -24,6 +28,23 @@ message EvaluateLoanRpcRequest {
   int32 term_months = 4;
   string annual_interest_rate = 5;
   string requested_at_iso = 6;
+}
+
+message SituationProjectionRpcResponse {
+  string application_id = 1;
+  string customer_id = 2;
+  string proposed_installment = 3;
+  string future_dti = 4;
+  string expected_monthly_liquidity = 5;
+  string projected_liquidity_trend = 6;
+  double risk_exposure_score = 7;
+  string affordability_buffer = 8;
+  bool is_affordable = 9;
+  int64 state_version = 10;
+  string rule_version = 11;
+  double completeness_score = 12;
+  string completeness_level = 13;
+  string projected_at_iso = 14;
 }
 
 message ReasonCodeRpc {
@@ -50,6 +71,9 @@ message EvaluateLoanRpcResponse {
   repeated ReasonCodeRpc adverse_action_reasons = 8;
   string statement_of_reasons = 9;
   string evaluated_at_iso = 10;
+  int64 state_version = 11;
+  double completeness_score = 12;
+  string completeness_level = 13;
 }
 
 message GetCustomerSituationRpcRequest {
@@ -65,6 +89,10 @@ message CustomerSituationRpcResponse {
   double max_network_risk_score = 6;
   repeated string connected_bank_peers = 7;
   int32 active_risk_exposures_count = 8;
+  int64 state_version = 9;
+  string income_stability = 10;
+  string liquidity_trend = 11;
+  double completeness_score = 12;
 }
 
 message IngestDocumentFactRpcRequest {
@@ -81,4 +109,3 @@ message IngestionAckRpcResponse {
   string reference_id = 2;
   string status = 3;
 }
-

@@ -10,24 +10,35 @@ import org.apache.pekko.persistence.typed.scaladsl.{Effect, EventSourcedBehavior
 
 /**
  * Callback interface used by a `CustomerAgent` to asynchronously propagate
- * a `PeerRiskSignal` to a connected peer's `CustomerAgent` in the Pekko Cluster.
+ * a `PeerRiskSignal` and Transactional Outbox entries to domain agents (`RiskSignalAgent`, `RelationshipAgent`,
+ * `PortfolioRiskAgent`) and Oracle Exadata projections in the Pekko Cluster.
  */
 trait PeerRiskRouter extends Serializable:
   def sendRiskSignal(targetCustomerId: String, signal: PeerRiskSignal): Unit
+
+  def onEventProcessedByPlugin(
+      customerId: String,
+      observedEvent: AgentObservedEvent,
+      result: PluginProcessingResult
+  ): Unit =
+    result.outboxEntries.flatMap(_.peerSignal).foreach { sig =>
+      sendRiskSignal(sig.targetCustomerId, sig)
+    }
 
 object PeerRiskRouter:
   val NoOp: PeerRiskRouter = (_: String, _: PeerRiskSignal) => ()
 
 /**
  * Digital Twin Actor (`CustomerAgent`) representing a single bank customer.
- * Identified uniquely by `CustomerId` via Pekko Cluster Sharding.
+ * Identified uniquely by `CustomerAgent:CUST-12345` via Pekko Cluster Sharding (Section 2.1).
  *
  * Responsibilities:
- * 1. Maintains real-time incremental sliding-window cashflow aggregates in memory.
- * 2. Stores verified external document facts (payslips, tax returns, external debt).
- * 3. Tracks localized Ego-Network connections and propagates 2nd-hop risk signals to peers.
- * 4. Evaluates consumer loan applications in <5ms with full regulatory explainability
- *    and persists an immutable audit snapshot of the decision and underlying situation state.
+ * 1. Routes every incoming observed event (`TransactionObserved`, `IncomeVerified`, `DebtUpdated`,
+ *    `CounterpartyRiskReceived`, `ExternalDocumentReceived`, `NetworkRiskPatternDetected`) to its configured
+ *    `SituationEventPlugin` via `EventPluginRegistry` (Section 2.1).
+ * 2. Persists both the observed event and the resulting `SituationEvaluated` event (`Event 1006`) in the Event Journal.
+ * 3. Guarantees Idempotency (including historical digest checks), Transactional Outbox persistence, and Situation Consistency (Section 10).
+ * 4. Separates Level-3 `ProjectLoanSituation` (future scenario projection) from formal `EvaluateLoan` decisioning (Section 7).
  */
 object CustomerAgent:
 
@@ -51,9 +62,29 @@ object CustomerAgent:
       replyTo: ActorRef[IngestionAck]
   ) extends Command
 
+  final case class IngestObservedEvent(
+      event: AgentObservedEvent,
+      replyTo: ActorRef[IngestionAck]
+  ) extends Command
+
   final case class PropagatePeerRisk(
       signal: PeerRiskSignal,
       replyTo: Option[ActorRef[IngestionAck]] = None
+  ) extends Command
+
+  final case class IngestNetworkRiskPattern(
+      pattern: NetworkRiskPatternDetected,
+      replyTo: Option[ActorRef[IngestionAck]] = None
+  ) extends Command
+
+  final case class ConfirmOutboxDelivery(
+      outboxId: String,
+      replyTo: Option[ActorRef[IngestionAck]] = None
+  ) extends Command
+
+  final case class ProjectLoanSituation(
+      application: LoanApplication,
+      replyTo: ActorRef[SituationProjection]
   ) extends Command
 
   final case class EvaluateLoan(
@@ -71,8 +102,21 @@ object CustomerAgent:
 
   case object Passivate extends Command
 
-  // --- EVENT JOURNAL PROTOCOL ---
+  // --- EVENT JOURNAL PROTOCOL (Section 2.1) ---
   sealed trait Event extends CborSerializable
+
+  final case class ObservedEventPersisted(
+      observed: AgentObservedEvent,
+      handledByPluginId: String
+  ) extends Event
+
+  final case class SituationEvaluated(
+      record: SituationEvaluatedRecord
+  ) extends Event
+
+  final case class OutboxDeliveryConfirmed(
+      outboxId: String
+  ) extends Event
 
   final case class TransactionIngested(tx: EnrichedTransaction) extends Event
   final case class DocumentFactIngested(fact: VerifiedDocumentFact) extends Event
@@ -87,15 +131,16 @@ object CustomerAgent:
   def apply(
       customerId: String,
       creditEngine: ExplainableCreditEngine,
-      peerRiskRouter: PeerRiskRouter = PeerRiskRouter.NoOp
+      peerRiskRouter: PeerRiskRouter = PeerRiskRouter.NoOp,
+      pluginRegistry: EventPluginRegistry = EventPluginRegistry.default
   ): Behavior[Command] =
     Behaviors.setup { context =>
       EventSourcedBehavior[Command, Event, CustomerSituationState](
         persistenceId = PersistenceId(TypeKey.name, customerId),
         emptyState = CustomerSituationState.empty(customerId),
         commandHandler = (state, command) =>
-          handleCommand(customerId, state, command, creditEngine, peerRiskRouter, context.log),
-        eventHandler = (state, event) => handleEvent(state, event)
+          handleCommand(customerId, state, command, creditEngine, peerRiskRouter, pluginRegistry, context.log),
+        eventHandler = (state, event) => handleEvent(state, event, pluginRegistry)
       ).withRetention(
         RetentionCriteria.snapshotEvery(numberOfEvents = 50, keepNSnapshots = 2)
       )
@@ -107,43 +152,62 @@ object CustomerAgent:
       command: Command,
       creditEngine: ExplainableCreditEngine,
       peerRiskRouter: PeerRiskRouter,
+      pluginRegistry: EventPluginRegistry,
       log: org.slf4j.Logger
   ): Effect[Event, CustomerSituationState] =
     command match
       case IngestTransaction(tx, replyTo) =>
-        if state.hasProcessedTx(tx.txId) then
-          Effect.reply(replyTo)(IngestionAck(customerId, tx.txId))
-        else
-          Effect
-            .persist[Event, CustomerSituationState](TransactionIngested(tx))
-            .thenRun { (updatedState: CustomerSituationState) =>
-              propagateRiskIfApplicable(customerId, tx, updatedState, peerRiskRouter, log)
-            }
-            .thenReply(replyTo)(_ => IngestionAck(customerId, tx.txId))
+        val observed = TransactionObserved(
+          eventId = tx.txId,
+          customerId = customerId,
+          tx = tx,
+          occurredAt = tx.timestamp
+        )
+        processObservedEvent(customerId, state, observed, Some(replyTo), peerRiskRouter, pluginRegistry, log)
 
       case IngestDocumentFact(fact, replyTo) =>
-        Effect
-          .persist(DocumentFactIngested(fact))
-          .thenReply(replyTo)(_ => IngestionAck(customerId, fact.docId))
+        val observed = DocumentVerificationAgent.classifyToObservedEvent(fact)
+        processObservedEvent(customerId, state, observed, Some(replyTo), peerRiskRouter, pluginRegistry, log)
+
+      case IngestObservedEvent(observed, replyTo) =>
+        processObservedEvent(customerId, state, observed, Some(replyTo), peerRiskRouter, pluginRegistry, log)
 
       case PropagatePeerRisk(signal, replyToOpt) =>
         if signal.hopCount > 2 || signal.originCustomerId == customerId then
           replyToOpt.foreach(_ ! IngestionAck(customerId, signal.signalId))
           Effect.none
         else
+          val observed = CounterpartyRiskReceived(
+            eventId = signal.signalId,
+            customerId = customerId,
+            signal = signal,
+            occurredAt = signal.emittedAt
+          )
+          processObservedEvent(customerId, state, observed, replyToOpt, peerRiskRouter, pluginRegistry, log)
+
+      case IngestNetworkRiskPattern(pattern, replyToOpt) =>
+        val observed = GlobalRiskIntelligenceReceived(
+          eventId = pattern.patternId,
+          customerId = customerId,
+          pattern = pattern,
+          occurredAt = pattern.detectedAt
+        )
+        processObservedEvent(customerId, state, observed, replyToOpt, peerRiskRouter, pluginRegistry, log)
+
+      case ConfirmOutboxDelivery(outboxId, replyToOpt) =>
+        if state.pendingOutbox.contains(outboxId) then
           Effect
-            .persist(PeerRiskSignalIngested(signal))
+            .persist(OutboxDeliveryConfirmed(outboxId))
             .thenRun { _ =>
-              log.info(
-                "[CustomerAgent:{}] Recorded {}-hop peer risk signal '{}' from peer '{}' (score={})",
-                customerId,
-                signal.hopCount,
-                signal.signalId,
-                signal.fromCustomerId,
-                f"${signal.attenuatedRiskScore}%.2f"
-              )
-              replyToOpt.foreach(_ ! IngestionAck(customerId, signal.signalId))
+              replyToOpt.foreach(_ ! IngestionAck(customerId, outboxId))
             }
+        else
+          replyToOpt.foreach(_ ! IngestionAck(customerId, outboxId))
+          Effect.none
+
+      case ProjectLoanSituation(application, replyTo) =>
+        val projection = creditEngine.projectSituation(state, application)
+        Effect.reply(replyTo)(projection)
 
       case EvaluateLoan(application, replyTo) =>
         val decision = creditEngine.evaluate(state, application)
@@ -162,11 +226,59 @@ object CustomerAgent:
       case Passivate =>
         Effect.stop()
 
+  private def processObservedEvent(
+      customerId: String,
+      state: CustomerSituationState,
+      observed: AgentObservedEvent,
+      replyToOpt: Option[ActorRef[IngestionAck]],
+      peerRiskRouter: PeerRiskRouter,
+      pluginRegistry: EventPluginRegistry,
+      log: org.slf4j.Logger
+  ): Effect[Event, CustomerSituationState] =
+    // Section 10 Idempotency: reject duplicate events (including historical digest matches)
+    if state.hasProcessedEvent(observed.eventId) then
+      replyToOpt.foreach(_ ! IngestionAck(customerId, observed.eventId))
+      Effect.none
+    else
+      val result = pluginRegistry.routeAndProcess(state, observed)
+      val eventsToPersist = List(
+        ObservedEventPersisted(observed, result.situationEvaluated.handledByPluginId),
+        SituationEvaluated(result.situationEvaluated)
+      )
+      Effect
+        .persist(eventsToPersist)
+        .thenRun { (updatedState: CustomerSituationState) =>
+          log.debug(
+            "[CustomerAgent:{}] Processed '{}' ('{}') via plugin '{}' -> SituationEvaluated(v={}, status={})",
+            customerId,
+            observed.eventType,
+            observed.eventId,
+            result.situationEvaluated.handledByPluginId,
+            updatedState.stateVersion,
+            updatedState.situationSummary.financialSituationStatus
+          )
+          peerRiskRouter.onEventProcessedByPlugin(customerId, observed, result.copy(updatedState = updatedState))
+          replyToOpt.foreach(_ ! IngestionAck(customerId, observed.eventId))
+        }
+
   private def handleEvent(
       state: CustomerSituationState,
-      event: Event
+      event: Event,
+      pluginRegistry: EventPluginRegistry
   ): CustomerSituationState =
     event match
+      case ObservedEventPersisted(observed, _) =>
+        pluginRegistry.routeAndProcess(state, observed).updatedState
+      case SituationEvaluated(record) =>
+        state.copy(
+          stateVersion = record.stateVersion,
+          ruleVersion = record.ruleVersion,
+          situationSummary = record.summary,
+          dataCompleteness = record.completeness,
+          lastUpdatedAt = if record.evaluatedAt.isAfter(state.lastUpdatedAt) then record.evaluatedAt else state.lastUpdatedAt
+        )
+      case OutboxDeliveryConfirmed(outboxId) =>
+        state.acknowledgeOutbox(outboxId)
       case TransactionIngested(tx) =>
         state.recordTransaction(tx)
       case DocumentFactIngested(fact) =>
@@ -176,84 +288,4 @@ object CustomerAgent:
       case CustomerStateReset(cid) =>
         CustomerSituationState.empty(cid)
       case _: LoanDecisionAudited =>
-        // Decision audit event is persisted for regulatory replay/immutability; state does not mutate.
         state
-
-  /**
-   * Decentralized Graph Risk Propagation:
-   * - Scenario A: This transaction is a direct 1st-hop hit with a restricted third party (`tx.restrictedTag.isDefined`).
-   *   We notify all currently connected bank peers in `updatedState.connectedBankPeers`.
-   * - Scenario B: This transaction is with another bank client (`tx.counterpartyIsBankClient`), and this customer
-   *   already carries a 1st-hop restricted exposure. We notify that newly/actively connected bank client.
-   */
-  private def propagateRiskIfApplicable(
-      customerId: String,
-      tx: EnrichedTransaction,
-      updatedState: CustomerSituationState,
-      peerRiskRouter: PeerRiskRouter,
-      log: org.slf4j.Logger
-  ): Unit =
-    tx.restrictedTag match
-      case Some(tag) =>
-        val attenuatedScore =
-          BigDecimal(tag.level.baseRiskWeight * SecondHopAttenuationFactor)
-            .setScale(4, BigDecimal.RoundingMode.HALF_UP)
-            .toDouble
-
-        updatedState.connectedBankPeers
-          .filterNot(_.counterpartyId == customerId)
-          .foreach { peerConn =>
-            val signal = PeerRiskSignal(
-              signalId = s"SIG-${tx.txId}-TO-${peerConn.counterpartyId}",
-              originCustomerId = tag.entityId,
-              fromCustomerId = customerId,
-              targetCustomerId = peerConn.counterpartyId,
-              hopCount = 2,
-              attenuatedRiskScore = attenuatedScore,
-              reasonCode = s"RC_302_PEER_LINK_${tag.level.toString.toUpperCase}",
-              reasonDescription =
-                s"Peer '$customerId' transacted (${tx.txId}) with restricted entity '${tag.entityId}' [${tag.listSource}: ${tag.reasonDescription}]",
-              rootEvidenceIds = (tx.txId :: peerConn.recentTxIds).distinct,
-              emittedAt = tx.timestamp
-            )
-            log.info(
-              "[CustomerAgent:{}] Propagating 2nd-hop risk signal '{}' to peer '{}'",
-              customerId,
-              signal.signalId,
-              peerConn.counterpartyId
-            )
-            peerRiskRouter.sendRiskSignal(peerConn.counterpartyId, signal)
-          }
-
-      case None if tx.counterpartyIsBankClient && tx.counterpartyId != customerId =>
-        // Check if this customer already has a 1st-hop restricted exposure to propagate to the counterparty
-        val directExposures = updatedState.riskExposures.valuesIterator.filter(_.hopDistance == 1).toList
-        directExposures.foreach { exposure =>
-          val attenuatedScore =
-            BigDecimal(exposure.riskScore * SecondHopAttenuationFactor)
-              .setScale(4, BigDecimal.RoundingMode.HALF_UP)
-              .toDouble
-
-          val signal = PeerRiskSignal(
-            signalId = s"SIG-${tx.txId}-FROM-$customerId-TO-${tx.counterpartyId}",
-            originCustomerId = exposure.sourceEntityId,
-            fromCustomerId = customerId,
-            targetCustomerId = tx.counterpartyId,
-            hopCount = 2,
-            attenuatedRiskScore = attenuatedScore,
-            reasonCode = exposure.reasonCode.replace("1HOP", "2HOP"),
-            reasonDescription =
-              s"Peer '$customerId' has prior restricted exposure (${exposure.description}) and transacted (${tx.txId}) with '${tx.counterpartyId}'",
-            rootEvidenceIds = (tx.txId :: exposure.evidenceIds).distinct,
-            emittedAt = tx.timestamp
-          )
-          log.info(
-            "[CustomerAgent:{}] Propagating existing 1st-hop exposure via 2nd-hop signal '{}' to peer '{}'",
-            customerId,
-            signal.signalId,
-            tx.counterpartyId
-          )
-          peerRiskRouter.sendRiskSignal(tx.counterpartyId, signal)
-        }
-
-      case _ => ()

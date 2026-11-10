@@ -44,12 +44,13 @@ final case class RawTransaction(
     currency: String,
     category: TransactionCategory,
     resultsInOverdraft: Boolean,
-    timestamp: Instant
+    timestamp: Instant,
+    merchantDescription: Option[String] = None
 ) extends Serializable
 
 /**
- * Enriched transaction emitted by the Flink pipeline and keyed by `customerId`
- * so it lands directly on the corresponding Pekko Cluster Shard.
+ * Enriched transaction emitted by the Flink pipeline (including external categorizer module)
+ * and keyed by `customerId` so it lands directly on the corresponding Pekko Cluster Shard.
  */
 final case class EnrichedTransaction(
     txId: String,
@@ -62,7 +63,8 @@ final case class EnrichedTransaction(
     category: TransactionCategory,
     resultsInOverdraft: Boolean,
     restrictedTag: Option[RestrictedEntityTag],
-    timestamp: Instant
+    timestamp: Instant,
+    categorizerSource: String = "ExternalCategorizerModule"
 ) extends Serializable
 
 enum DocumentFactType:
@@ -84,8 +86,8 @@ final case class VerifiedDocumentFact(
 ) extends Serializable
 
 /**
- * Asynchronous risk signal propagated between CustomerAgents in the Pekko cluster
- * to replace expensive centralized graph traversals at decision time.
+ * Asynchronous risk signal propagated between agents in the Pekko cluster
+ * with Reliable Delivery & Transactional Outbox deduplication guarantees (Section 10).
  */
 final case class PeerRiskSignal(
     signalId: String,
@@ -97,7 +99,119 @@ final case class PeerRiskSignal(
     reasonCode: String,
     reasonDescription: String,
     rootEvidenceIds: List[String],
-    emittedAt: Instant
+    emittedAt: Instant,
+    outboxId: Option[String] = None
+) extends Serializable
+
+/**
+ * Global Graph Risk Intelligence pattern types detected by Oracle Exadata Property Graph (`SA_GRAPH` / `SA_INTELLIGENCE`, Section 5 & 14).
+ */
+enum NetworkRiskPatternType:
+  case SharedHighRiskCounterparty
+  case SimilarTransactionPattern
+  case SegmentRiskConcentration
+  case HighDegreeNodeExposure
+  case OrganizedRiskCommunity
+
+/**
+ * Risk intelligence event emitted by Oracle Exadata Global Relationship Graph analysis (`NetworkRiskPatternDetected`, Section 5 & 14)
+ * and delivered via Kafka to Pekko CustomerAgents and PortfolioRiskAgents.
+ */
+final case class NetworkRiskPatternDetected(
+    patternId: String,
+    patternType: NetworkRiskPatternType,
+    affectedCustomerId: String,
+    sharedEntityId: String,
+    linkedCustomers: List[String],
+    riskScore: Double,
+    reasonCode: String,
+    description: String,
+    evidenceIds: List[String],
+    detectedAt: Instant
+) extends Serializable
+
+/**
+ * Observed domain events processed by `CustomerAgent` via the configurable Plugin Architecture (Section 2.1):
+ * - Event 1001: TransactionObserved
+ * - Event 1002: IncomeVerified
+ * - Event 1003: DebtUpdated
+ * - Event 1004: CounterpartyRiskReceived
+ * - Event 1005: ExternalDocumentReceived
+ * - Event 1006: GlobalRiskIntelligenceReceived (NetworkRiskPatternDetected)
+ */
+sealed trait AgentObservedEvent extends Serializable:
+  def eventId: String
+  def customerId: String
+  def occurredAt: Instant
+  def eventType: String
+
+final case class TransactionObserved(
+    eventId: String,
+    customerId: String,
+    tx: EnrichedTransaction,
+    occurredAt: Instant
+) extends AgentObservedEvent:
+  override val eventType: String = "TransactionObserved"
+
+final case class IncomeVerified(
+    eventId: String,
+    customerId: String,
+    fact: VerifiedDocumentFact,
+    monthlyNetIncome: BigDecimal,
+    occurredAt: Instant
+) extends AgentObservedEvent:
+  override val eventType: String = "IncomeVerified"
+
+final case class DebtUpdated(
+    eventId: String,
+    customerId: String,
+    fact: VerifiedDocumentFact,
+    monthlyDebtAmount: BigDecimal,
+    creditor: String,
+    occurredAt: Instant
+) extends AgentObservedEvent:
+  override val eventType: String = "DebtUpdated"
+
+final case class CounterpartyRiskReceived(
+    eventId: String,
+    customerId: String,
+    signal: PeerRiskSignal,
+    occurredAt: Instant
+) extends AgentObservedEvent:
+  override val eventType: String = "CounterpartyRiskReceived"
+
+final case class ExternalDocumentReceived(
+    eventId: String,
+    customerId: String,
+    fact: VerifiedDocumentFact,
+    occurredAt: Instant
+) extends AgentObservedEvent:
+  override val eventType: String = "ExternalDocumentReceived"
+
+final case class GlobalRiskIntelligenceReceived(
+    eventId: String,
+    customerId: String,
+    pattern: NetworkRiskPatternDetected,
+    occurredAt: Instant
+) extends AgentObservedEvent:
+  override val eventType: String = "NetworkRiskPatternDetected"
+
+/**
+ * Transactional Outbox entry persisted atomically with the agent's journal event
+ * to guarantee reliable side-effect delivery even if the node crashes before sending (Section 10).
+ */
+enum OutboxTargetType:
+  case CustomerAgent, RelationshipAgent, RiskSignalAgent, PortfolioRiskAgent, OracleProjection
+
+final case class OutboxEntry(
+    outboxId: String,
+    sourceCustomerId: String,
+    targetType: OutboxTargetType,
+    targetEntityId: String,
+    messageType: String,
+    payloadSummary: String,
+    peerSignal: Option[PeerRiskSignal] = None,
+    createdAt: Instant
 ) extends Serializable
 
 /** Customer loan request arriving from the Loan Origination Gateway. */
@@ -119,4 +233,3 @@ final case class LoanApplication(
       val factor      = math.pow(1.0 + monthlyRate, termMonths.toDouble)
       val payment     = requestedAmount.toDouble * (monthlyRate * factor) / (factor - 1.0)
       BigDecimal(payment).setScale(2, BigDecimal.RoundingMode.HALF_UP)
-

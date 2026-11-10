@@ -6,7 +6,7 @@ import com.bank.sa.enrichment.EnrichmentLogic
 import org.apache.pekko.actor.typed.ActorSystem
 import org.apache.pekko.cluster.typed.Cluster
 import org.apache.pekko.http.scaladsl.Http
-import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpEntity, HttpMethods, HttpResponse, StatusCodes}
+import org.apache.pekko.http.scaladsl.model.{ContentTypes, HttpMethods, HttpResponse, StatusCodes}
 import org.apache.pekko.http.scaladsl.model.headers.*
 import org.apache.pekko.http.scaladsl.model.headers.CacheDirectives.*
 import org.apache.pekko.http.scaladsl.server.Directives.*
@@ -15,12 +15,11 @@ import org.apache.pekko.http.scaladsl.server.Route
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import scala.concurrent.{ExecutionContext, Future}
-import scala.io.Source
-import scala.util.{Failure, Success, Using}
+import scala.util.{Failure, Success}
 
 /**
- * Pekko HTTP & gRPC Gateway Layer for Real-Time Loan Origination, Interactive Business UI,
- * and Internal Agent / Workflow Investigation.
+ * Pekko HTTP & gRPC Gateway Layer for Real-Time Loan Origination, Level-3 Situation Projection,
+ * Oracle Exadata 6-Schema & Global Graph Inspection, Hierarchical Agents, and Interactive Business UI.
  */
 class LoanOriginationServer(
     gateway: CustomerClusterGateway,
@@ -46,7 +45,7 @@ class LoanOriginationServer(
           complete(HttpResponse(StatusCodes.OK))
         },
 
-        // 0. Interactive Business & Agent Inspector UI (with no-cache headers so browser always loads latest UI)
+        // 0. Interactive Business & Agent Inspector UI
         pathSingleSlash {
           get {
             respondWithHeader(`Cache-Control`(`no-cache`, `no-store`, `must-revalidate`)) {
@@ -84,7 +83,7 @@ class LoanOriginationServer(
         // 2. REST API v1 Endpoints
         pathPrefix("api" / "v1") {
           concat(
-            // GET /api/v1/system/overview — Full cluster, agent, and workflow trace inspector
+            // GET /api/v1/system/overview — Full cluster, agent, plugins, Oracle schemas, and workflow trace inspector
             path("system" / "overview") {
               get {
                 val now         = Instant.now()
@@ -99,11 +98,54 @@ class LoanOriginationServer(
                       customers = snapshots,
                       watchlist = watchlistProvider().values.toList.map(WatchlistEntryDto.fromDomain),
                       workflowTraces = gateway.getWorkflowTraces,
-                      recentDecisions = gateway.getRecentDecisions
+                      recentDecisions = gateway.getRecentDecisions,
+                      registeredEventPlugins = gateway.pluginRegistry.registeredPluginIds,
+                      oracleSchemasStatus = gateway.oracleRepository.getSchemaRecordCounts,
+                      globalPatternsDetected = gateway.oracleRepository.getRiskIntelligenceEvents
                     )
                     complete(StatusCodes.OK, overview)
                   case Failure(ex) =>
                     complete(StatusCodes.InternalServerError, Map("error" -> ex.getMessage))
+                }
+              }
+            },
+
+            // GET /api/v1/oracle/overview — Inspect all 6 Oracle Exadata Schemas (Section 2, 3, 4, 5, 11)
+            path("oracle" / "overview") {
+              get {
+                val repo = gateway.oracleRepository
+                val dto = OracleExadataOverviewDto(
+                  schemasRecordCounts = repo.getSchemaRecordCounts,
+                  journalEntries = repo.getJournalEntries(50),
+                  boundedSnapshots = repo.getSnapshots,
+                  pendingOutbox = repo.getPendingOutbox,
+                  transactionFacts = repo.getTransactionFacts(50),
+                  verifiedDocumentFacts = repo.getVerifiedDocumentFacts,
+                  graphVertices = repo.getGraphVertices,
+                  graphEdges = repo.getGraphEdges,
+                  riskIntelligenceEvents = repo.getRiskIntelligenceEvents,
+                  governancePolicies = repo.getGovernancePolicies
+                )
+                complete(StatusCodes.OK, dto)
+              }
+            },
+
+            // POST /api/v1/oracle/graph/analyze — Execute Oracle Exadata Global Property Graph Analysis (Section 5 & 14)
+            path("oracle" / "graph" / "analyze") {
+              post {
+                onComplete(gateway.runGlobalGraphAnalysis(Instant.now())) {
+                  case Success(patterns) => complete(StatusCodes.OK, patterns)
+                  case Failure(ex)       => complete(StatusCodes.InternalServerError, Map("error" -> ex.getMessage))
+                }
+              }
+            },
+
+            // GET /api/v1/agents/hierarchy — Hierarchical Situation Awareness across all 5 Agent Types (Section 6 & 15)
+            path("agents" / "hierarchy") {
+              get {
+                onComplete(gateway.getGlobalBankingSituation(Instant.now())) {
+                  case Success(globalSituation) => complete(StatusCodes.OK, globalSituation)
+                  case Failure(ex)              => complete(StatusCodes.InternalServerError, Map("error" -> ex.getMessage))
                 }
               }
             },
@@ -118,7 +160,19 @@ class LoanOriginationServer(
               }
             },
 
-            // POST /api/v1/loans/evaluate
+            // POST /api/v1/loans/project — Level-3 Situation Projection (independent of formal approval, Section 7)
+            path("loans" / "project") {
+              post {
+                entity(as[LoanOriginationRequest]) { request =>
+                  onComplete(grpcService.projectLoan(request)) {
+                    case Success(projectionDto) => complete(StatusCodes.OK, projectionDto)
+                    case Failure(ex)            => complete(StatusCodes.InternalServerError, Map("error" -> ex.getMessage))
+                  }
+                }
+              }
+            },
+
+            // POST /api/v1/loans/evaluate — Formal Explainable Credit Decision
             path("loans" / "evaluate") {
               post {
                 entity(as[LoanOriginationRequest]) { request =>
@@ -170,12 +224,14 @@ class LoanOriginationServer(
                   gateway.recordTrace(
                     stage = "FLINK_ENRICHMENT",
                     fromComponent = "Kafka(tx.raw.v1)",
-                    toComponent = "Flink(BilateralSplitter + WatchlistBroadcast)",
+                    toComponent = "Flink(Validator + ExternalCategorizer + BilateralSplitter + WatchlistBroadcast)",
                     eventType = if enrichedList.size > 1 then "BilateralSplit (2 Perspectives)" else "SinglePerspective",
                     summary =
-                      s"Flink enriched raw tx '${rawDomain.txId}' (${rawDomain.fromCustomerId} -> ${rawDomain.toCounterpartyId}, ${rawDomain.amount} EUR) into ${enrichedList.size} sharded event(s)",
+                      s"Flink validated, categorized via '${EnrichmentLogic.DefaultCategorizer.categorizerName}', and enriched raw tx '${rawDomain.txId}' (${rawDomain.fromCustomerId} -> ${rawDomain.toCounterpartyId}, ${rawDomain.amount} EUR) into ${enrichedList.size} sharded event(s)",
                     details = Map(
                       "txId" -> rawDomain.txId,
+                      "categorizer" -> EnrichmentLogic.DefaultCategorizer.categorizerName,
+                      "assignedCategory" -> enrichedList.headOption.map(_.category.toString).getOrElse(rawDomain.category.toString),
                       "perspectivesEmitted" -> enrichedList.map(e => s"${e.customerId}:${e.direction}").mkString(", "),
                       "watchlistHit" -> enrichedList.flatMap(_.restrictedTag).headOption.map(_.entityId).getOrElse("None")
                     ),
@@ -199,6 +255,13 @@ class LoanOriginationServer(
         // 3. gRPC Service Path Endpoints (/com.bank.sa.proto.v1.LoanOriginationService/*)
         pathPrefix("com.bank.sa.proto.v1.LoanOriginationService") {
           concat(
+            path("ProjectLoan") {
+              post {
+                entity(as[LoanOriginationRequest]) { request =>
+                  complete(grpcService.projectLoan(request))
+                }
+              }
+            },
             path("EvaluateLoan") {
               post {
                 entity(as[LoanOriginationRequest]) { request =>
@@ -220,7 +283,7 @@ class LoanOriginationServer(
     val now = Instant.now()
     stepName match
       case "step0-reset" =>
-        gateway.resetAll().map(_ => "Workbench state reset: all active CustomerAgent shards and telemetry logs cleared.")
+        gateway.resetAll().map(_ => "Workbench state reset: all 5 sharded agent types, Oracle Exadata schemas, and telemetry logs cleared.")
 
       case "step1-bootstrap" =>
         val docs = Seq(
@@ -282,14 +345,14 @@ class LoanOriginationServer(
         gateway.recordTrace(
           stage = "FLINK_ENRICHMENT",
           fromComponent = "Kafka(tx.raw.v1)",
-          toComponent = "Flink(BilateralSplitter)",
+          toComponent = "Flink(ExternalCategorizer + BilateralSplitter)",
           eventType = "BatchEnrichment",
-          summary = s"Bootstrapped ${docs.size} verified documents and ${enriched.size} bilateral transaction events for Alice & Bob"
+          summary = s"Bootstrapped ${docs.size} verified documents via DocumentVerificationAgent and ${enriched.size} bilateral transaction events for Alice & Bob"
         )
         for
           _ <- Future.traverse(docs)(gateway.ingestDocumentFact)
           _ <- Future.traverse(enriched)(gateway.ingestTransaction)
-        yield "Step 1 complete: Alice and Bob profiles hydrated with verified payslips and bilateral peer link (TX-PEER-ALICE-BOB-101)."
+        yield "Step 1 complete: Alice and Bob profiles hydrated via DocumentVerificationAgent, EventPluginRegistry, RelationshipAgent, and Oracle Exadata SA_FACTS."
 
       case "step2-alice-healthy-loan" =>
         val app = LoanApplication(
@@ -301,7 +364,7 @@ class LoanOriginationServer(
           requestedAt = now
         )
         gateway.evaluateLoan(app).map { res =>
-          s"Step 2 complete: Evaluated ${app.applicationId} for Alice -> Score ${res.auditTrail.finalCreditScore}/850."
+          s"Step 2 complete: Evaluated ${app.applicationId} for Alice -> Score ${res.auditTrail.finalCreditScore}/850 (State v${res.auditTrail.stateVersion})."
         }
 
       case "step3-bob-sanction-contagion" =>
@@ -328,7 +391,7 @@ class LoanOriginationServer(
           _ <- Future.traverse(enriched)(gateway.ingestTransaction)
           bobLoan = LoanApplication("LOAN-BOB-DENIED-01", "CUST-BOB-002", BigDecimal("10000.00"), 24, BigDecimal("0.065"), now)
           _ <- gateway.evaluateLoan(bobLoan)
-        yield "Step 3 complete: Bob transacted with ENTITY-SHADOW-LTD -> 1st-hop hit on Bob AND 2nd-hop PeerRiskSignal propagated to Alice!"
+        yield "Step 3 complete: Bob transacted with ENTITY-SHADOW-LTD -> 1st-hop hit on Bob AND reliable 2nd-hop PeerRiskSignal delivered via RiskSignalAgent & Outbox to Alice!"
 
       case "step4-alice-distress-loan" =>
         val distressTxs = Seq(
@@ -339,9 +402,10 @@ class LoanOriginationServer(
             counterpartyIsBankClient = false,
             amount = BigDecimal("600.00"),
             currency = "EUR",
-            category = TransactionCategory.Gambling,
+            category = TransactionCategory.EverydaySpend, // ExternalCategorizerModule automatically re-categorizes CASINO-ROYALE-BET to Gambling!
             resultsInOverdraft = true,
-            timestamp = now.minus(10, ChronoUnit.MINUTES)
+            timestamp = now.minus(10, ChronoUnit.MINUTES),
+            merchantDescription = Some("CASINO ROYALE BETTING TERMINAL")
           ),
           RawTransaction(
             txId = "TX-GAMB-ALICE-202",
@@ -350,9 +414,10 @@ class LoanOriginationServer(
             counterpartyIsBankClient = false,
             amount = BigDecimal("500.00"),
             currency = "EUR",
-            category = TransactionCategory.Gambling,
+            category = TransactionCategory.EverydaySpend,
             resultsInOverdraft = true,
-            timestamp = now.minus(5, ChronoUnit.MINUTES)
+            timestamp = now.minus(5, ChronoUnit.MINUTES),
+            merchantDescription = Some("CASINO ROYALE BETTING TERMINAL")
           )
         )
         val enriched = EnrichmentLogic.enrichBatchInMemory(distressTxs, watchlistProvider())
@@ -367,7 +432,49 @@ class LoanOriginationServer(
         for
           _ <- Future.traverse(enriched)(gateway.ingestTransaction)
           _ <- gateway.evaluateLoan(aliceLoan2)
-        yield "Step 4 complete: Evaluated Alice's second loan -> DENIED with 2nd-hop peer contagion, high-risk spend velocity, and overdraft reason codes."
+        yield "Step 4 complete: Evaluated Alice's second loan -> DENIED with 2nd-hop peer contagion, external-categorized gambling velocity, and overdraft reason codes."
+
+      case "step5-global-graph-intelligence" =>
+        val charlieDoc = VerifiedDocumentFact(
+          docId = "DOC-PAYSLIP-CHARLIE-01",
+          customerId = "CUST-CHARLIE-003",
+          factType = DocumentFactType.VerifiedMonthlyNetIncome,
+          numericValue = Some(BigDecimal("4500.00")),
+          textValue = Some("Senior Analyst"),
+          issuer = "National Tax & Payroll Registry",
+          verifiedAt = now.minus(3, ChronoUnit.DAYS)
+        )
+        val charlieTxs = Seq(
+          RawTransaction(
+            txId = "TX-SAL-CHARLIE-01",
+            fromCustomerId = "GLOBAL-CORP-PAYROLL",
+            toCounterpartyId = "CUST-CHARLIE-003",
+            counterpartyIsBankClient = true,
+            amount = BigDecimal("4500.00"),
+            currency = "EUR",
+            category = TransactionCategory.Salary,
+            resultsInOverdraft = false,
+            timestamp = now.minus(2, ChronoUnit.DAYS)
+          ),
+          RawTransaction(
+            txId = "TX-SHADOW-CHARLIE-888",
+            fromCustomerId = "CUST-CHARLIE-003",
+            toCounterpartyId = "CASINO-ROYALE-BET",
+            counterpartyIsBankClient = false,
+            amount = BigDecimal("500.00"),
+            currency = "EUR",
+            category = TransactionCategory.EverydaySpend,
+            resultsInOverdraft = false,
+            timestamp = now.minus(1, ChronoUnit.MINUTES),
+            merchantDescription = Some("CASINO ROYALE BET")
+          )
+        )
+        val enriched = EnrichmentLogic.enrichBatchInMemory(charlieTxs, watchlistProvider())
+        for
+          _        <- gateway.ingestDocumentFact(charlieDoc)
+          _        <- Future.traverse(enriched)(gateway.ingestTransaction)
+          patterns <- gateway.runGlobalGraphAnalysis(now)
+        yield s"Step 5 complete: Oracle Exadata Global Graph (SA_GRAPH) detected ${patterns.size} multi-account risk pattern(s) and emitted NetworkRiskPatternDetected to CustomerAgents & PortfolioRiskAgent!"
 
       case other =>
         Future.failed(new IllegalArgumentException(s"Unknown demo scenario step: $other"))
@@ -381,7 +488,7 @@ object LoanOriginationServer:
       entityId = "ENTITY-SHADOW-LTD",
       level = RestrictionLevel.SanctionedEntity,
       listSource = "EU-AML-SANCTIONS-2026",
-      reasonDescription = "Sanctioned shell company linked tos illicit financial flows"
+      reasonDescription = "Sanctioned shell company linked to illicit financial flows"
     ),
     "UNLICENSED-LENDER-88" -> RestrictedEntityTag(
       entityId = "UNLICENSED-LENDER-88",

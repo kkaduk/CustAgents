@@ -4,7 +4,7 @@ import com.bank.sa.domain.*
 import java.time.Duration
 
 /**
- * Policy thresholds for the hybrid deterministic rule + scorecard engine.
+ * Policy thresholds for the hybrid deterministic rule + scorecard engine (stored in Oracle `SA_GOVERNANCE`).
  */
 final case class CreditPolicyConfig(
     policyVersion: String = "SA-CREDIT-POLICY-2026.11",
@@ -14,29 +14,95 @@ final case class CreditPolicyConfig(
     max30DayHighRiskSpendRatio: BigDecimal = BigDecimal("0.15"),
     max30DayOverdraftCount: Int = 1,
     max1HopRiskScore: Double = 0.50,
-    max2HopRiskScore: Double = 0.45
+    max2HopRiskScore: Double = 0.45,
+    maxGlobalGraphRiskScore: Double = 0.50
 )
 
 /**
- * Pure, deterministic Explainable Credit Decisioning Engine (Level 3 Situation Awareness).
- * Evaluates a customer's real-time `CustomerSituationState` against a `LoanApplication`
- * and produces a legally compliant Statement of Reasons with exact evidence IDs and counterfactuals.
+ * Pure, deterministic Explainable Credit Decisioning & Level-3 Situation Projection Engine (Section 7, 10, 13).
+ *
+ * Distinguishes:
+ * 1. `projectSituation(state, application)`: Computes future scenario metrics (`Future DTI`, `Expected Liquidity`,
+ *    `Risk Exposure`, `Affordability`, `stateVersion`, `dataCompleteness`) independently of formal approval authority.
+ * 2. `evaluate(state, application)`: Evaluates a customer's real-time `CustomerSituationState` against a `LoanApplication`
+ *    and produces a legally compliant Statement of Reasons with exact evidence IDs, counterfactuals, state version, and completeness.
  */
 class ExplainableCreditEngine(val config: CreditPolicyConfig = CreditPolicyConfig()) extends Serializable:
 
-  def evaluate(state: CustomerSituationState, application: LoanApplication): LoanDecisionResponse =
+  /**
+   * Level-3 Situation Awareness Projection (Section 7):
+   * Calculates what will happen to the customer's financial situation if the proposed loan is granted.
+   */
+  def projectSituation(state: CustomerSituationState, application: LoanApplication): SituationProjection =
     val refTime       = application.requestedAt
     val metrics30d    = state.cashflow.metricsForWindow(refTime, Duration.ofDays(30))
-    val metrics7d     = state.cashflow.metricsForWindow(refTime, Duration.ofDays(7))
     val installment   = application.estimatedMonthlyInstallment
+    val docIncomeOpt  = state.verifiedFacts.get(DocumentFactType.VerifiedMonthlyNetIncome).flatMap(_.numericValue)
+    val externalDebt  = state.verifiedFacts.get(DocumentFactType.ExternalDebtObligation).flatMap(_.numericValue).getOrElse(BigDecimal(0))
+    val monthlyIncome = docIncomeOpt.getOrElse(metrics30d.totalInflow)
 
-    val traces = List(
+    val totalProjectedDebt = externalDebt + installment
+    val futureDti =
+      if monthlyIncome > BigDecimal(0) then
+        (totalProjectedDebt / monthlyIncome).setScale(4, BigDecimal.RoundingMode.HALF_UP)
+      else BigDecimal(1.0)
+
+    val maxAllowedDebt      = (monthlyIncome * config.maxDebtToIncomeRatio).setScale(2, BigDecimal.RoundingMode.HALF_UP)
+    val affordabilityBuffer = (maxAllowedDebt - totalProjectedDebt).setScale(2, BigDecimal.RoundingMode.HALF_UP)
+    val expectedLiquidity   = (monthlyIncome - metrics30d.totalOutflow - installment).setScale(2, BigDecimal.RoundingMode.HALF_UP)
+
+    val projectedTrend =
+      if expectedLiquidity < BigDecimal(0) || metrics30d.overdraftCount > config.max30DayOverdraftCount then
+        LiquidityTrend.Critical
+      else if expectedLiquidity < installment then
+        LiquidityTrend.Decreasing
+      else if expectedLiquidity >= installment * 2 then
+        LiquidityTrend.Positive
+      else
+        LiquidityTrend.Stable
+
+    val isAffordable =
+      monthlyIncome > BigDecimal(0) &&
+        futureDti <= config.maxDebtToIncomeRatio &&
+        expectedLiquidity >= BigDecimal(0) &&
+        state.maxNetworkRiskScore < config.max2HopRiskScore
+
+    SituationProjection(
+      applicationId = application.applicationId,
+      customerId = state.customerId,
+      proposedInstallment = installment,
+      futureDti = futureDti,
+      expectedMonthlyLiquidity = expectedLiquidity,
+      projectedLiquidityTrend = projectedTrend,
+      riskExposureScore = state.maxNetworkRiskScore,
+      affordabilityBuffer = affordabilityBuffer,
+      isAffordable = isAffordable,
+      stateVersion = state.stateVersion,
+      ruleVersion = config.policyVersion,
+      dataCompleteness = state.dataCompleteness,
+      projectedAt = refTime
+    )
+
+  /**
+   * Formal Explainable Credit Evaluation (Section 7, 10, 13).
+   */
+  def evaluate(state: CustomerSituationState, application: LoanApplication): LoanDecisionResponse =
+    val refTime     = application.requestedAt
+    val projection  = projectSituation(state, application)
+    val metrics30d  = state.cashflow.metricsForWindow(refTime, Duration.ofDays(30))
+    val metrics7d   = state.cashflow.metricsForWindow(refTime, Duration.ofDays(7))
+    val installment = application.estimatedMonthlyInstallment
+
+    val baseTraces = List(
       evaluateVerifiedIncomeAndAffordability(state, metrics30d, application, installment),
       evaluateShortTermLiquidityShock(metrics7d, metrics30d),
       evaluateHighRiskSpendVelocity(metrics30d),
       evaluateDirectRestrictedExposure(state),
       evaluateSecondHopPeerContagion(state)
     )
+
+    val globalGraphTraceOpt = evaluateGlobalGraphRiskPattern(state)
+    val traces              = baseTraces ++ globalGraphTraceOpt.toList
 
     val rawScore      = config.baseScore + traces.map(_.pointsDelta).sum
     val finalScore    = math.max(300, math.min(850, rawScore))
@@ -46,6 +112,8 @@ class ExplainableCreditEngine(val config: CreditPolicyConfig = CreditPolicyConfi
 
     val statement = buildRegulatoryStatement(
       customerId = state.customerId,
+      state = state,
+      projection = projection,
       application = application,
       approved = isApproved,
       finalScore = finalScore,
@@ -60,7 +128,10 @@ class ExplainableCreditEngine(val config: CreditPolicyConfig = CreditPolicyConfi
       minimumRequiredScore = config.minimumApprovalScore,
       ruleTraces = traces,
       principalAdverseReasons = failedReasons,
-      statementOfReasons = statement
+      statementOfReasons = statement,
+      stateVersion = state.stateVersion,
+      dataCompleteness = state.dataCompleteness,
+      situationProjection = Some(projection)
     )
 
     val outcome =
@@ -93,14 +164,14 @@ class ExplainableCreditEngine(val config: CreditPolicyConfig = CreditPolicyConfi
   private def fmt1(bd: BigDecimal): String =
     bd.setScale(1, BigDecimal.RoundingMode.HALF_UP).toString
 
-  /** Rule 1: Verified Income & Real-Time Debt-to-Income (DTI) Affordability */
+  /** Rule 1: Verified Income & Real-Time Debt-to-Income (DTI) Affordability + Situation Completeness */
   private def evaluateVerifiedIncomeAndAffordability(
       state: CustomerSituationState,
       metrics30d: WindowMetrics,
       app: LoanApplication,
       proposedInstallment: BigDecimal
   ): RuleEvaluationTrace =
-    val docIncomeOpt   = state.verifiedFacts.get(DocumentFactType.VerifiedMonthlyNetIncome)
+    val docIncomeOpt    = state.verifiedFacts.get(DocumentFactType.VerifiedMonthlyNetIncome)
     val externalDebtOpt = state.verifiedFacts.get(DocumentFactType.ExternalDebtObligation)
 
     val verifiedIncome = docIncomeOpt.flatMap(_.numericValue).getOrElse(metrics30d.totalInflow)
@@ -110,11 +181,11 @@ class ExplainableCreditEngine(val config: CreditPolicyConfig = CreditPolicyConfi
     if verifiedIncome <= BigDecimal(0) then
       val reason = ReasonCode(
         code = "RC_101_INSUFFICIENT_VERIFIED_INCOME",
-        title = "Unverified or Insufficient Monthly Income",
+        title = "Unverified or Insufficient Monthly Income (Incomplete Situation Data)",
         regulatoryStatement =
-          "Unable to verify sufficient recurring monthly net income from submitted documents or 30-day account inflows.",
+          "Unable to verify sufficient recurring monthly net income from submitted documents or 30-day account inflows. Absence of verified information cannot be interpreted as absence of risk.",
         metricName = "VerifiedMonthlyIncome",
-        actualValue = s"${fmt2(verifiedIncome)} EUR",
+        actualValue = s"${fmt2(verifiedIncome)} EUR (Completeness: ${state.dataCompleteness.level})",
         thresholdValue = s"> ${fmt2(proposedInstallment / config.maxDebtToIncomeRatio)} EUR",
         evidenceIds = evidenceIds,
         counterfactualGuidance =
@@ -225,7 +296,7 @@ class ExplainableCreditEngine(val config: CreditPolicyConfig = CreditPolicyConfi
   /** Rule 5: Indirect (2nd-Hop) Peer Network Risk Contagion */
   private def evaluateSecondHopPeerContagion(state: CustomerSituationState): RuleEvaluationTrace =
     val peerExposures = state.riskExposures.valuesIterator
-      .filter(e => e.hopDistance >= 2 && e.riskScore >= config.max2HopRiskScore)
+      .filter(e => e.hopDistance == 2 && e.riskScore >= config.max2HopRiskScore)
       .toList
       .sortBy(-_.riskScore)
 
@@ -250,13 +321,45 @@ class ExplainableCreditEngine(val config: CreditPolicyConfig = CreditPolicyConfi
       case None =>
         RuleEvaluationTrace("RULE_NETWORK_CONTAGION_2HOP", "2nd-Hop Ego-Network Risk Contagion", passed = true, 0, None)
 
+  /** Rule 6 (Section 5 & 14): Oracle Exadata Global Graph Risk Pattern (`NetworkRiskPatternDetected`) */
+  private def evaluateGlobalGraphRiskPattern(state: CustomerSituationState): Option[RuleEvaluationTrace] =
+    val globalExposures = state.riskExposures.valuesIterator
+      .filter(e => e.hopDistance >= 3 && e.riskScore >= config.maxGlobalGraphRiskScore)
+      .toList
+      .sortBy(-_.riskScore)
+
+    globalExposures.headOption.map { worst =>
+      val allEvidence = globalExposures.flatMap(_.evidenceIds).distinct
+      val reason = ReasonCode(
+        code = "RC_303_GLOBAL_GRAPH_RISK_PATTERN",
+        title = "Global Relationship Graph Risk Pattern Detected (Oracle Exadata SA_GRAPH)",
+        regulatoryStatement =
+          s"Global graph analysis identified structural risk pattern involving '${worst.sourceEntityId}': ${worst.description} (score ${f"${worst.riskScore}%.2f"} >= ${f"${config.maxGlobalGraphRiskScore}%.2f"}).",
+        metricName = "GlobalGraphPatternRiskScore",
+        actualValue = f"${worst.riskScore}%.2f (Global Pattern: ${worst.sourceEntityId})",
+        thresholdValue = f"< ${config.maxGlobalGraphRiskScore}%.2f",
+        evidenceIds = allEvidence,
+        counterfactualGuidance =
+          s"Global compliance review required for multi-account counterparty cluster '${worst.sourceEntityId}' (evidence: ${allEvidence.mkString(", ")}).",
+        isHardKnockout = false,
+        scorePenalty = 135
+      )
+      RuleEvaluationTrace("RULE_GLOBAL_GRAPH_PATTERN", "Oracle Exadata Global Graph Pattern Screening", passed = false, -135, Some(reason))
+    }
+
   private def buildRegulatoryStatement(
       customerId: String,
+      state: CustomerSituationState,
+      projection: SituationProjection,
       application: LoanApplication,
       approved: Boolean,
       finalScore: Int,
       principalReasons: List[ReasonCode]
   ): String =
+    val consistencyHeader =
+      s"State Version  : v${state.stateVersion} | Policy: ${config.policyVersion} | Data Completeness: ${fmt1(BigDecimal(state.dataCompleteness.score * 100))}% (${state.dataCompleteness.level})\n" +
+        s"Projection     : Future DTI=${fmt1(projection.futureDti * 100)}%, Expected Monthly Liquidity=${fmt2(projection.expectedMonthlyLiquidity)} EUR, Trend=${projection.projectedLiquidityTrend}"
+
     if approved then
       s"""STATEMENT OF CREDIT DECISION (APPROVED)
          |Application ID : ${application.applicationId}
@@ -264,6 +367,7 @@ class ExplainableCreditEngine(val config: CreditPolicyConfig = CreditPolicyConfi
          |Decision       : APPROVED for ${fmt2(application.requestedAmount)} EUR over ${application.termMonths} months
          |Monthly Payment: ${fmt2(application.estimatedMonthlyInstallment)} EUR
          |Composite Score: $finalScore / 850 (Minimum Required: ${config.minimumApprovalScore})
+         |$consistencyHeader
          |Summary        : Customer real-time cashflow, verified income documents, and counterparty network checks met all credit policy requirements.""".stripMargin
     else
       val reasonsBlock = principalReasons.zipWithIndex
@@ -282,6 +386,7 @@ class ExplainableCreditEngine(val config: CreditPolicyConfig = CreditPolicyConfi
          |Decision       : DENIED (${fmt2(application.requestedAmount)} EUR for ${application.termMonths} months)
          |Composite Score: $finalScore / 850 (Minimum Required: ${config.minimumApprovalScore})
          |Policy Version : ${config.policyVersion}
+         |$consistencyHeader
          |
          |Principal Reasons for Denial:
          |$reasonsBlock""".stripMargin

@@ -1,7 +1,7 @@
 package com.bank.sa.enrichment
 
 import com.bank.sa.domain.*
-import org.apache.flink.api.common.functions.FlatMapFunction
+import org.apache.flink.api.common.functions.{FilterFunction, FlatMapFunction, MapFunction}
 import org.apache.flink.api.common.state.MapStateDescriptor
 import org.apache.flink.api.common.typeinfo.TypeInformation
 import org.apache.flink.streaming.api.datastream.{BroadcastStream, DataStream}
@@ -10,7 +10,46 @@ import org.apache.flink.streaming.api.functions.co.KeyedBroadcastProcessFunction
 import org.apache.flink.util.Collector
 
 /**
- * Bilateral transaction perspective created before watchlist enrichment.
+ * External Transaction Categorizer Module interface invoked by the Apache Flink enrichment pipeline
+ * (Intro & Section 8 of Doc/ExaPekdoDesign.md:
+ *  "Apache Flink jest warstwą intensywnego przetwarzania strumieniowego, służy do enrichment transakcji.
+ *   Obecnie w tym strumieniu wywoływany jest zewnętrzny moduł kategoryzatora, który zwraca kategorię przypisana do transakcji.")
+ */
+trait ExternalTransactionCategorizer extends Serializable:
+  def categorizerName: String
+  def categorize(raw: RawTransaction): TransactionCategory
+
+/**
+ * Default deterministic rule & merchant-signature implementation of `ExternalTransactionCategorizer`.
+ * Inspects counterparty IDs, merchant descriptions, and payment metadata to assign canonical `TransactionCategory`.
+ */
+class RuleBasedExternalCategorizer extends ExternalTransactionCategorizer:
+  override val categorizerName: String = "ExternalCategorizerModule-v2.1"
+
+  override def categorize(raw: RawTransaction): TransactionCategory =
+    val cpUpper   = raw.toCounterpartyId.toUpperCase
+    val descUpper = raw.merchantDescription.getOrElse("").toUpperCase
+    val combined  = s"$cpUpper $descUpper"
+
+    if combined.contains("CASINO") || combined.contains("BET") || combined.contains("LOTTO") || combined.contains("GAMBL") then
+      TransactionCategory.Gambling
+    else if combined.contains("CRYPTO") || combined.contains("BINANCE") || combined.contains("COIN") || combined.contains("DARKNET") then
+      TransactionCategory.CryptoExchange
+    else if combined.contains("SHADOW") || combined.contains("SANCTION") || combined.contains("UNLICENSED") || combined.contains("OFFSHORE") then
+      TransactionCategory.HighRiskTransfer
+    else if combined.contains("EMPLOYER") || combined.contains("PAYROLL") || combined.contains("SALARY") then
+      TransactionCategory.Salary
+    else if combined.contains("HOUSING") || combined.contains("LANDLORD") || combined.contains("RENT") || combined.contains("MORTGAGE") then
+      TransactionCategory.Housing
+    else if combined.contains("UTILITY") || combined.contains("ENERGY") || combined.contains("ELECTRIC") || combined.contains("WATER") then
+      TransactionCategory.Utilities
+    else if combined.contains("LOAN-REPAY") || combined.contains("CREDIT-BANK") then
+      TransactionCategory.LoanRepayment
+    else
+      raw.category
+
+/**
+ * Bilateral transaction perspective created during Flink enrichment.
  * Keyed by `customerId` so downstream Kafka partitions and Pekko shards align 1-to-1.
  */
 final case class CustomerDirectedTransaction(
@@ -23,22 +62,43 @@ final case class CustomerDirectedTransaction(
     currency: String,
     category: TransactionCategory,
     resultsInOverdraft: Boolean,
-    timestamp: java.time.Instant
+    timestamp: java.time.Instant,
+    categorizerSource: String = "ExternalCategorizerModule-v2.1"
 ) extends Serializable
 
 /**
- * Splits a raw payment rail event into one or two customer-keyed perspectives:
+ * Stage 1 (Section 8): Flink `Validation` operator filtering out malformed or non-positive transactions.
+ */
+class TransactionValidationFilter extends FilterFunction[RawTransaction] with Serializable:
+  override def filter(raw: RawTransaction): Boolean =
+    EnrichmentLogic.isValid(raw)
+
+/**
+ * Stage 2a (Intro & Section 8): Flink `External Categorizer Enrichment` operator invoking the external
+ * categorizer module to assign/refine the transaction category before bilateral splitting.
+ */
+class ExternalCategorizerMapFunction(
+    categorizer: ExternalTransactionCategorizer = new RuleBasedExternalCategorizer()
+) extends MapFunction[RawTransaction, RawTransaction] with Serializable:
+  override def map(raw: RawTransaction): RawTransaction =
+    EnrichmentLogic.categorizeRaw(raw, categorizer)
+
+/**
+ * Stage 3 (Section 8): Splits a validated, categorized payment rail event into one or two customer-keyed perspectives:
  * - Outflow event for `fromCustomerId`
  * - Inflow event for `toCounterpartyId` (when the counterparty is also a bank client)
  */
-class BilateralTransactionSplitter extends FlatMapFunction[RawTransaction, CustomerDirectedTransaction] with Serializable:
+class BilateralTransactionSplitter(
+    categorizerSource: String = "ExternalCategorizerModule-v2.1"
+) extends FlatMapFunction[RawTransaction, CustomerDirectedTransaction] with Serializable:
 
   override def flatMap(raw: RawTransaction, out: Collector[CustomerDirectedTransaction]): Unit =
-    EnrichmentLogic.splitBilateral(raw).foreach(out.collect)
+    EnrichmentLogic.splitBilateral(raw, categorizerSource).foreach(out.collect)
 
 /**
- * Flink `KeyedBroadcastProcessFunction` that joins the high-throughput customer transaction stream
- * with a dynamically updated Broadcast State of restricted entities (AML / Sanctions / Fraud Watchlists).
+ * Stage 2b & 4 (Section 8): Flink `KeyedBroadcastProcessFunction` that joins the customer transaction stream
+ * with a dynamically updated Broadcast State of restricted entities (AML / Sanctions / Fraud Watchlists)
+ * and normalizes the output into canonical `EnrichedTransaction` events.
  */
 class WatchlistBroadcastEnricher(
     watchlistDescriptor: MapStateDescriptor[String, RestrictedEntityTag]
@@ -82,8 +142,15 @@ class WatchlistBroadcastEnricher(
 
 /**
  * Pure enrichment helper logic shared between the Flink cluster pipeline and in-memory test harnesses.
+ * Implements all four Section 8 stages:
+ *   1. Validation
+ *   2. Enrichment (External Categorizer + Watchlist Broadcast)
+ *   3. Bilateral Split
+ *   4. Event Normalization
  */
 object EnrichmentLogic:
+
+  val DefaultCategorizer: ExternalTransactionCategorizer = new RuleBasedExternalCategorizer()
 
   val WatchlistStateDescriptor: MapStateDescriptor[String, RestrictedEntityTag] =
     new MapStateDescriptor[String, RestrictedEntityTag](
@@ -92,7 +159,25 @@ object EnrichmentLogic:
       TypeInformation.of(classOf[RestrictedEntityTag])
     )
 
-  def splitBilateral(raw: RawTransaction): List[CustomerDirectedTransaction] =
+  def isValid(raw: RawTransaction): Boolean =
+    raw != null &&
+      raw.txId.nonEmpty &&
+      raw.fromCustomerId.nonEmpty &&
+      raw.toCounterpartyId.nonEmpty &&
+      raw.amount > BigDecimal(0) &&
+      raw.currency.nonEmpty
+
+  def categorizeRaw(
+      raw: RawTransaction,
+      categorizer: ExternalTransactionCategorizer = DefaultCategorizer
+  ): RawTransaction =
+    val assignedCategory = categorizer.categorize(raw)
+    raw.copy(category = assignedCategory)
+
+  def splitBilateral(
+      raw: RawTransaction,
+      categorizerSource: String = DefaultCategorizer.categorizerName
+  ): List[CustomerDirectedTransaction] =
     val outflow = CustomerDirectedTransaction(
       txId = raw.txId,
       customerId = raw.fromCustomerId,
@@ -103,7 +188,8 @@ object EnrichmentLogic:
       currency = raw.currency,
       category = raw.category,
       resultsInOverdraft = raw.resultsInOverdraft,
-      timestamp = raw.timestamp
+      timestamp = raw.timestamp,
+      categorizerSource = categorizerSource
     )
 
     if raw.counterpartyIsBankClient then
@@ -117,7 +203,8 @@ object EnrichmentLogic:
         currency = raw.currency,
         category = raw.category,
         resultsInOverdraft = false,
-        timestamp = raw.timestamp
+        timestamp = raw.timestamp,
+        categorizerSource = categorizerSource
       )
       List(outflow, inflow)
     else List(outflow)
@@ -137,38 +224,53 @@ object EnrichmentLogic:
       category = tx.category,
       resultsInOverdraft = tx.resultsInOverdraft,
       restrictedTag = restrictedTag,
-      timestamp = tx.timestamp
+      timestamp = tx.timestamp,
+      categorizerSource = tx.categorizerSource
     )
 
   def enrichBatchInMemory(
       rawTransactions: Seq[RawTransaction],
-      watchlist: Map[String, RestrictedEntityTag]
+      watchlist: Map[String, RestrictedEntityTag],
+      categorizer: ExternalTransactionCategorizer = DefaultCategorizer
   ): List[EnrichedTransaction] =
     rawTransactions.toList
-      .flatMap(splitBilateral)
+      .filter(isValid)
+      .map(raw => categorizeRaw(raw, categorizer))
+      .flatMap(raw => splitBilateral(raw, categorizer.categorizerName))
       .map(directed => toEnriched(directed, watchlist.get(directed.counterpartyId)))
 
-  /** Builds the Flink streaming topology for Level-1 Perception enrichment. */
+  /**
+   * Builds the full Flink streaming topology for Level-1 Perception enrichment (Section 8):
+   * Validation -> External Categorizer Enrichment -> Bilateral Split -> Watchlist Broadcast & Normalization
+   */
   def buildFlinkTopology(
       env: StreamExecutionEnvironment,
       rawTxStream: DataStream[RawTransaction],
-      watchlistStream: DataStream[RestrictedEntityTag]
+      watchlistStream: DataStream[RestrictedEntityTag],
+      categorizer: ExternalTransactionCategorizer = DefaultCategorizer
   ): DataStream[EnrichedTransaction] =
-    val directedTypeInfo  = TypeInformation.of(classOf[CustomerDirectedTransaction])
-    val enrichedTypeInfo  = TypeInformation.of(classOf[EnrichedTransaction])
-    val keyTypeInfo       = TypeInformation.of(classOf[String])
+    val rawTypeInfo      = TypeInformation.of(classOf[RawTransaction])
+    val directedTypeInfo = TypeInformation.of(classOf[CustomerDirectedTransaction])
+    val enrichedTypeInfo = TypeInformation.of(classOf[EnrichedTransaction])
+    val keyTypeInfo      = TypeInformation.of(classOf[String])
 
     val broadcastWatchlist: BroadcastStream[RestrictedEntityTag] =
       watchlistStream.broadcast(WatchlistStateDescriptor)
 
-    val directedStream: DataStream[CustomerDirectedTransaction] =
+    val validatedAndCategorized: DataStream[RawTransaction] =
       rawTxStream
-        .flatMap(new BilateralTransactionSplitter(), directedTypeInfo)
+        .filter(new TransactionValidationFilter())
+        .name("transaction-validator")
+        .map(new ExternalCategorizerMapFunction(categorizer), rawTypeInfo)
+        .name("external-categorizer-enricher")
+
+    val directedStream: DataStream[CustomerDirectedTransaction] =
+      validatedAndCategorized
+        .flatMap(new BilateralTransactionSplitter(categorizer.categorizerName), directedTypeInfo)
         .name("bilateral-tx-splitter")
 
     directedStream
       .keyBy((tx: CustomerDirectedTransaction) => tx.customerId, keyTypeInfo)
       .connect(broadcastWatchlist)
       .process(new WatchlistBroadcastEnricher(WatchlistStateDescriptor), enrichedTypeInfo)
-      .name("watchlist-broadcast-enricher")
-
+      .name("watchlist-broadcast-enricher-and-normalizer")

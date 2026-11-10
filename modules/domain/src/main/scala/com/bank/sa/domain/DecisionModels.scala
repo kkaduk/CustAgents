@@ -3,6 +3,27 @@ package com.bank.sa.domain
 import java.time.Instant
 
 /**
+ * Level-3 Situation Awareness Projection (Section 7):
+ * Evaluates potential future consequences of a proposed loan (`Future DTI`, `Expected Liquidity`,
+ * `Risk Exposure`, `Affordability`) independently of formal credit decision approval.
+ */
+final case class SituationProjection(
+    applicationId: String,
+    customerId: String,
+    proposedInstallment: BigDecimal,
+    futureDti: BigDecimal,
+    expectedMonthlyLiquidity: BigDecimal,
+    projectedLiquidityTrend: LiquidityTrend,
+    riskExposureScore: Double,
+    affordabilityBuffer: BigDecimal,
+    isAffordable: Boolean,
+    stateVersion: Long,
+    ruleVersion: String,
+    dataCompleteness: DataCompleteness,
+    projectedAt: Instant
+) extends Serializable
+
+/**
  * Regulatory Adverse Action Reason Code (compliant with EU AI Act / GDPR Art. 22 / US ECOA).
  * Ties a specific rejection or score penalty to factual live metrics and immutable evidence IDs.
  */
@@ -28,7 +49,7 @@ final case class RuleEvaluationTrace(
     reasonCode: Option[ReasonCode]
 ) extends Serializable
 
-/** Full explainable audit trail persisted alongside every loan decision. */
+/** Full explainable audit trail persisted alongside every loan decision (Section 7, 10, 13). */
 final case class ExplainableAuditTrail(
     policyVersion: String,
     evaluatedAt: Instant,
@@ -37,7 +58,10 @@ final case class ExplainableAuditTrail(
     minimumRequiredScore: Int,
     ruleTraces: List[RuleEvaluationTrace],
     principalAdverseReasons: List[ReasonCode],
-    statementOfReasons: String
+    statementOfReasons: String,
+    stateVersion: Long = 1L,
+    dataCompleteness: DataCompleteness = DataCompleteness(),
+    situationProjection: Option[SituationProjection] = None
 ) extends Serializable
 
 enum DecisionOutcome extends Serializable:
@@ -61,4 +85,3 @@ final case class LoanDecisionResponse(
     auditTrail: ExplainableAuditTrail,
     evaluatedAt: Instant
 ) extends Serializable
-

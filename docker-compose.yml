@@ -40,10 +40,14 @@ services:
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 4
 
-  scylladb:
-    image: scylladb/scylla:6.1
-    container_name: sa-scylladb
+  oracle-exadata:
+    image: gvenzl/oracle-free:23-slim
+    container_name: sa-oracle-exadata
     ports:
-      - "9042:9042"
-    command: --smp 1 --memory 1G --overprovisioned 1
-
+      - "1521:1521"
+    environment:
+      ORACLE_PASSWORD: Exadata_SA_Root_2026
+      APP_USER: SA_PERSISTENCE
+      APP_USER_PASSWORD: Exadata_SA_Persist_2026
+    volumes:
+      - ./sql/oracle_exadata_schemas.sql:/container-entrypoint-initdb.d/01_oracle_exadata_schemas.sql:ro

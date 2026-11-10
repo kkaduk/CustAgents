@@ -1,6 +1,7 @@
 package com.bank.sa.api
 
 import com.bank.sa.domain.*
+import com.bank.sa.oracle.*
 import com.fasterxml.jackson.databind.{DeserializationFeature, ObjectMapper, SerializationFeature}
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.scala.DefaultScalaModule
@@ -59,7 +60,8 @@ final case class RawTransactionIngestRequest(
     currency: String,
     category: String,
     resultsInOverdraft: Boolean,
-    timestamp: Option[Instant] = None
+    timestamp: Option[Instant] = None,
+    merchantDescription: Option[String] = None
 ):
   def toDomain: RawTransaction =
     RawTransaction(
@@ -71,10 +73,47 @@ final case class RawTransactionIngestRequest(
       currency = Option(currency).getOrElse("EUR"),
       category = TransactionCategory.valueOf(category),
       resultsInOverdraft = resultsInOverdraft,
-      timestamp = Option(timestamp).flatten.getOrElse(Instant.now())
+      timestamp = Option(timestamp).flatten.getOrElse(Instant.now()),
+      merchantDescription = Option(merchantDescription).flatten
     )
 
 // --- RESPONSE DTOs ---
+
+final case class SituationProjectionDto(
+    applicationId: String,
+    customerId: String,
+    proposedInstallment: BigDecimal,
+    futureDti: BigDecimal,
+    expectedMonthlyLiquidity: BigDecimal,
+    projectedLiquidityTrend: String,
+    riskExposureScore: Double,
+    affordabilityBuffer: BigDecimal,
+    isAffordable: Boolean,
+    stateVersion: Long,
+    ruleVersion: String,
+    completenessScore: Double,
+    completenessLevel: String,
+    projectedAt: Instant
+)
+
+object SituationProjectionDto:
+  def fromDomain(p: SituationProjection): SituationProjectionDto =
+    SituationProjectionDto(
+      applicationId = p.applicationId,
+      customerId = p.customerId,
+      proposedInstallment = p.proposedInstallment,
+      futureDti = p.futureDti,
+      expectedMonthlyLiquidity = p.expectedMonthlyLiquidity,
+      projectedLiquidityTrend = p.projectedLiquidityTrend.toString,
+      riskExposureScore = p.riskExposureScore,
+      affordabilityBuffer = p.affordabilityBuffer,
+      isAffordable = p.isAffordable,
+      stateVersion = p.stateVersion,
+      ruleVersion = p.ruleVersion,
+      completenessScore = p.dataCompleteness.score,
+      completenessLevel = p.dataCompleteness.level.toString,
+      projectedAt = p.projectedAt
+    )
 
 final case class ReasonCodeDto(
     code: String,
@@ -120,6 +159,10 @@ final case class LoanOriginationDecisionDto(
     creditScore: Int,
     minimumRequiredScore: Int,
     policyVersion: String,
+    stateVersion: Long,
+    completenessScore: Double,
+    completenessLevel: String,
+    situationProjection: Option[SituationProjectionDto],
     ruleTraces: List[RuleTraceDto],
     adverseActionReasons: List[ReasonCodeDto],
     statementOfReasons: String,
@@ -143,6 +186,10 @@ object LoanOriginationDecisionDto:
       creditScore = response.auditTrail.finalCreditScore,
       minimumRequiredScore = response.auditTrail.minimumRequiredScore,
       policyVersion = response.auditTrail.policyVersion,
+      stateVersion = response.auditTrail.stateVersion,
+      completenessScore = response.auditTrail.dataCompleteness.score,
+      completenessLevel = response.auditTrail.dataCompleteness.level.toString,
+      situationProjection = response.auditTrail.situationProjection.map(SituationProjectionDto.fromDomain),
       ruleTraces = response.auditTrail.ruleTraces.map(t =>
         RuleTraceDto(t.ruleId, t.ruleName, t.passed, t.pointsDelta)
       ),
@@ -164,6 +211,15 @@ final case class RiskExposureDto(
 
 final case class CustomerSituationSnapshotDto(
     customerId: String,
+    stateVersion: Long,
+    ruleVersion: String,
+    segmentId: String,
+    incomeStability: String,
+    liquidityTrend: String,
+    financialSituationStatus: String,
+    completenessScore: Double,
+    completenessLevel: String,
+    missingFacts: List[String],
     inflow30d: BigDecimal,
     outflow30d: BigDecimal,
     netCashflow30d: BigDecimal,
@@ -173,6 +229,7 @@ final case class CustomerSituationSnapshotDto(
     connectedBankPeers: List[String],
     maxNetworkRiskScore: Double,
     riskExposures: List[RiskExposureDto],
+    pendingOutboxCount: Int,
     lastUpdatedAt: Instant
 )
 
@@ -199,6 +256,15 @@ object CustomerSituationSnapshotDto:
 
     CustomerSituationSnapshotDto(
       customerId = state.customerId,
+      stateVersion = state.stateVersion,
+      ruleVersion = state.ruleVersion,
+      segmentId = state.segmentId,
+      incomeStability = state.situationSummary.incomeStability.toString,
+      liquidityTrend = state.situationSummary.liquidityTrend.toString,
+      financialSituationStatus = state.situationSummary.financialSituationStatus,
+      completenessScore = state.dataCompleteness.score,
+      completenessLevel = state.dataCompleteness.level.toString,
+      missingFacts = state.dataCompleteness.missingFacts,
       inflow30d = metrics30d.totalInflow,
       outflow30d = metrics30d.totalOutflow,
       netCashflow30d = metrics30d.netCashflow,
@@ -208,6 +274,7 @@ object CustomerSituationSnapshotDto:
       connectedBankPeers = state.connectedBankPeers.map(_.counterpartyId),
       maxNetworkRiskScore = state.maxNetworkRiskScore,
       riskExposures = exposures,
+      pendingOutboxCount = state.pendingOutbox.size,
       lastUpdatedAt = state.lastUpdatedAt
     )
 
@@ -228,7 +295,7 @@ final case class HealthStatusDto(
  */
 final case class WorkflowTraceEventDto(
     sequenceNo: Long,
-    stage: String,      // e.g. "FLINK_ENRICHMENT", "PEKKO_SHARD_ACTOR", "AGENT_TO_AGENT_IPC", "EXPLAINABLE_ENGINE"
+    stage: String, // e.g. "FLINK_ENRICHMENT", "PEKKO_SHARD_ACTOR", "EVENT_PLUGIN_ENGINE", "AGENT_TO_AGENT_IPC", "ORACLE_GLOBAL_GRAPH", "SITUATION_PROJECTION", "EXPLAINABLE_ENGINE"
     fromComponent: String,
     toComponent: String,
     eventType: String,
@@ -260,7 +327,23 @@ final case class SystemOverviewDto(
     customers: List[CustomerSituationSnapshotDto],
     watchlist: List[WatchlistEntryDto],
     workflowTraces: List[WorkflowTraceEventDto],
-    recentDecisions: List[LoanOriginationDecisionDto]
+    recentDecisions: List[LoanOriginationDecisionDto],
+    registeredEventPlugins: List[String] = Nil,
+    oracleSchemasStatus: Map[String, Int] = Map.empty,
+    globalPatternsDetected: List[NetworkRiskPatternDetected] = Nil
+)
+
+final case class OracleExadataOverviewDto(
+    schemasRecordCounts: Map[String, Int],
+    journalEntries: List[OracleJournalRow],
+    boundedSnapshots: List[OracleSnapshotRow],
+    pendingOutbox: List[OutboxEntry],
+    transactionFacts: List[FinancialTransactionFactRow],
+    verifiedDocumentFacts: List[VerifiedDocumentFact],
+    graphVertices: List[GraphVertex],
+    graphEdges: List[GraphEdge],
+    riskIntelligenceEvents: List[NetworkRiskPatternDetected],
+    governancePolicies: List[GovernancePolicyRow]
 )
 
 /**
@@ -285,4 +368,3 @@ object JacksonJsonSupport:
       val jsonBytes = mapper.writeValueAsBytes(value)
       HttpEntity(ContentTypes.`application/json`, jsonBytes)
     }
-

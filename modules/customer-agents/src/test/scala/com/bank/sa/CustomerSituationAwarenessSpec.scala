@@ -40,9 +40,9 @@ class CustomerSituationAwarenessSpec
     cluster.manager ! Join(cluster.selfMember.address)
     gateway = new CustomerClusterGateway(system, creditEngine)
 
-  "The Real-Time Banking Situation Awareness Architecture" should {
+  "The Real-Time Banking Situation Awareness Architecture (Apache Pekko + Oracle Exadata)" should {
 
-    "split bilateral transactions and tag restricted counterparties in the enrichment pipeline" in {
+    "validate, categorize via ExternalTransactionCategorizer, split bilateral transactions, and tag restricted counterparties in Flink" in {
       val now = Instant.parse("2026-11-07T12:00:00Z")
       val watchlist = Map(
         "SANCTIONED-ENTITY-77" -> RestrictedEntityTag(
@@ -65,6 +65,19 @@ class CustomerSituationAwarenessSpec
         timestamp = now
       )
 
+      val uncategorizedGamblingRaw = RawTransaction(
+        txId = "TX-CASINO-1",
+        fromCustomerId = "CLIENT-1",
+        toCounterpartyId = "ROYAL-CASINO-HUB",
+        counterpartyIsBankClient = false,
+        amount = BigDecimal("400.00"),
+        currency = "EUR",
+        category = TransactionCategory.EverydaySpend, // ExternalCategorizerModule should classify this as Gambling
+        resultsInOverdraft = false,
+        timestamp = now,
+        merchantDescription = Some("ROYAL CASINO BETTING")
+      )
+
       val restrictedRaw = RawTransaction(
         txId = "TX-SANCTION-1",
         fromCustomerId = "CLIENT-2",
@@ -77,10 +90,10 @@ class CustomerSituationAwarenessSpec
         timestamp = now
       )
 
-      val enriched = EnrichmentLogic.enrichBatchInMemory(Seq(p2pRaw, restrictedRaw), watchlist)
+      val enriched = EnrichmentLogic.enrichBatchInMemory(Seq(p2pRaw, uncategorizedGamblingRaw, restrictedRaw), watchlist)
 
-      // P2P between two bank clients produces 2 directed events; external produces 1
-      enriched should have size 3
+      // P2P between two bank clients produces 2 directed events; two external txs produce 1 each -> total 4
+      enriched should have size 4
       val client1Out = enriched.find(e => e.txId == "TX-P2P-1" && e.customerId == "CLIENT-1").value
       client1Out.direction shouldBe TransactionDirection.Outflow
       client1Out.counterpartyId shouldBe "CLIENT-2"
@@ -90,11 +103,52 @@ class CustomerSituationAwarenessSpec
       client2In.direction shouldBe TransactionDirection.Inflow
       client2In.counterpartyId shouldBe "CLIENT-1"
 
+      val casinoEnriched = enriched.find(_.txId == "TX-CASINO-1").value
+      casinoEnriched.category shouldBe TransactionCategory.Gambling
+      casinoEnriched.categorizerSource should include("ExternalCategorizerModule")
+
       val sanctionOut = enriched.find(_.txId == "TX-SANCTION-1").value
       sanctionOut.restrictedTag.map(_.entityId) shouldBe Some("SANCTIONED-ENTITY-77")
     }
 
-    "approve a healthy customer and provide an explainable denial when 2nd-hop peer risk & overdrafts occur" in {
+    "route observed events through EventPluginRegistry and guarantee Idempotency, Transactional Outbox, and Situation Consistency" in {
+      val now = Instant.parse("2026-11-07T13:00:00Z")
+      val registry = EventPluginRegistry.default
+
+      registry.registeredPluginIds should contain allOf (
+        "plugin.sa.transaction-observed.v1",
+        "plugin.sa.income-verified.v1",
+        "plugin.sa.debt-updated.v1",
+        "plugin.sa.counterparty-risk-received.v1",
+        "plugin.sa.external-document-received.v1",
+        "plugin.sa.global-risk-intelligence.v1"
+      )
+
+      val initialState = CustomerSituationState.empty("CUST-PLUGIN-TEST")
+      val incomeDoc = VerifiedDocumentFact(
+        docId = "DOC-INC-100",
+        customerId = "CUST-PLUGIN-TEST",
+        factType = DocumentFactType.VerifiedMonthlyNetIncome,
+        numericValue = Some(BigDecimal("5000.00")),
+        textValue = Some("Permanent Contract"),
+        issuer = "TaxRegistry",
+        verifiedAt = now
+      )
+      val incomeEvent = IncomeVerified("DOC-INC-100", "CUST-PLUGIN-TEST", incomeDoc, BigDecimal("5000.00"), now)
+      val res1        = registry.routeAndProcess(initialState, incomeEvent)
+
+      res1.situationEvaluated.handledByPluginId shouldBe "plugin.sa.income-verified.v1"
+      res1.updatedState.situationSummary.monthlyIncome shouldBe BigDecimal("5000.00")
+      res1.updatedState.situationSummary.incomeStability shouldBe IncomeStability.High
+      res1.updatedState.dataCompleteness.hasVerifiedIncome shouldBe true
+      res1.updatedState.stateVersion shouldBe 2L
+
+      // Verify idempotency: re-recording the same document or transaction does not increment stateVersion or double-count
+      val duplicateState = res1.updatedState.recordDocumentFact(incomeDoc)
+      duplicateState.stateVersion shouldBe res1.updatedState.stateVersion
+    }
+
+    "approve a healthy customer, compute Level-3 Situation Projections, and provide an explainable denial when 2nd-hop peer risk & overdrafts occur" in {
       given scala.concurrent.ExecutionContext = system.executionContext
       val now = Instant.parse("2026-11-07T15:00:00Z")
 
@@ -107,7 +161,7 @@ class CustomerSituationAwarenessSpec
         )
       )
 
-      // 1. Ingest verified income documents for Client A and Client B
+      // 1. Ingest verified income documents for Client A and Client B via DocumentVerificationAgent
       val docA = VerifiedDocumentFact(
         docId = "DOC-INC-A",
         customerId = "CLIENT-A",
@@ -119,7 +173,7 @@ class CustomerSituationAwarenessSpec
       )
       gateway.ingestDocumentFact(docA).futureValue
 
-      // 2. Client A receives salary and transfers money to Client B (creating a peer link)
+      // 2. Client A receives salary and transfers money to Client B (creating a peer link & RelationshipAgent state)
       val baseTxs = EnrichmentLogic.enrichBatchInMemory(
         Seq(
           RawTransaction(
@@ -149,7 +203,7 @@ class CustomerSituationAwarenessSpec
       )
       Future.traverse(baseTxs)(gateway.ingestTransaction).futureValue
 
-      // 3. Evaluate initial loan for Client A -> Approved
+      // 3. Compute Level-3 Situation Projection & Evaluate initial loan for Client A -> Approved
       val loan1 = LoanApplication(
         applicationId = "APP-A-1",
         customerId = "CLIENT-A",
@@ -158,10 +212,15 @@ class CustomerSituationAwarenessSpec
         annualInterestRate = BigDecimal("0.05"),
         requestedAt = now.minus(1, ChronoUnit.HOURS)
       )
+      val projection1 = gateway.projectLoanSituation(loan1).futureValue
+      projection1.isAffordable shouldBe true
+      projection1.futureDti should be < BigDecimal("0.40")
+
       val decision1 = gateway.evaluateLoan(loan1).futureValue
       decision1.outcome shouldBe a[DecisionOutcome.Approved]
+      decision1.auditTrail.situationProjection shouldBe defined
 
-      // 4. Client B transacts with BLACKLIST-CORP-99 -> triggers 2nd-hop risk propagation to Client A
+      // 4. Client B transacts with BLACKLIST-CORP-99 -> triggers 2nd-hop risk propagation via RiskSignalAgent & Outbox to Client A
       val riskyTxs = EnrichmentLogic.enrichBatchInMemory(
         Seq(
           RawTransaction(
@@ -180,10 +239,13 @@ class CustomerSituationAwarenessSpec
       )
       Future.traverse(riskyTxs)(gateway.ingestTransaction).futureValue
 
-      // Verify Client A's actor receives the asynchronous 2nd-hop risk signal from Client B
+      // Verify Client A's actor receives the reliable 2nd-hop risk signal and Client B's Transactional Outbox is confirmed
       eventually {
         val stateA = gateway.getSituationState("CLIENT-A").futureValue
         stateA.riskExposures.values.exists(e => e.hopDistance == 2 && e.intermediaryPeerId.contains("CLIENT-B")) shouldBe true
+
+        val stateB = gateway.getSituationState("CLIENT-B").futureValue
+        stateB.pendingOutbox shouldBe empty
       }
 
       // 5. Client A applies for a second loan -> Denied with exact 2nd-hop contagion reason code & evidence IDs
@@ -205,7 +267,68 @@ class CustomerSituationAwarenessSpec
       denied.statementOfReasons should include("RC_302_INDIRECT_NETWORK_RISK_CONTAGION")
     }
 
-    "serve loan origination evaluations and customer situation snapshots over Pekko HTTP and gRPC endpoints" in {
+    "execute the Oracle Exadata Global Relationship Graph cycle (SA_GRAPH -> NetworkRiskPatternDetected -> CustomerAgent & PortfolioRiskAgent)" in {
+      given scala.concurrent.ExecutionContext = system.executionContext
+      val now = Instant.parse("2026-11-07T15:30:00Z")
+
+      val watchlist = Map(
+        "SHARED-OFFSHORE-HUB" -> RestrictedEntityTag(
+          entityId = "SHARED-OFFSHORE-HUB",
+          level = RestrictionLevel.FraudWatchlist,
+          listSource = "GLOBAL-GRAPH-WATCH",
+          reasonDescription = "Shared offshore shell entity"
+        )
+      )
+
+      // Two seemingly independent clients (CLIENT-G1 and CLIENT-G2) both transact with SHARED-OFFSHORE-HUB
+      val graphTxs = EnrichmentLogic.enrichBatchInMemory(
+        Seq(
+          RawTransaction(
+            txId = "TX-G1-HUB",
+            fromCustomerId = "CLIENT-G1",
+            toCounterpartyId = "SHARED-OFFSHORE-HUB",
+            counterpartyIsBankClient = false,
+            amount = BigDecimal("900.00"),
+            currency = "EUR",
+            category = TransactionCategory.HighRiskTransfer,
+            resultsInOverdraft = false,
+            timestamp = now.minus(10, ChronoUnit.MINUTES)
+          ),
+          RawTransaction(
+            txId = "TX-G2-HUB",
+            fromCustomerId = "CLIENT-G2",
+            toCounterpartyId = "SHARED-OFFSHORE-HUB",
+            counterpartyIsBankClient = false,
+            amount = BigDecimal("1100.00"),
+            currency = "EUR",
+            category = TransactionCategory.HighRiskTransfer,
+            resultsInOverdraft = false,
+            timestamp = now.minus(5, ChronoUnit.MINUTES)
+          )
+        ),
+        watchlist
+      )
+      Future.traverse(graphTxs)(gateway.ingestTransaction).futureValue
+
+      val detectedPatterns = gateway.runGlobalGraphAnalysis(now).futureValue
+      detectedPatterns.map(_.sharedEntityId) should contain("SHARED-OFFSHORE-HUB")
+
+      val stateG1 = gateway.getSituationState("CLIENT-G1").futureValue
+      stateG1.riskExposures.values.exists(e => e.hopDistance == 3 && e.sourceEntityId == "SHARED-OFFSHORE-HUB") shouldBe true
+
+      val globalSituation = gateway.getGlobalBankingSituation(now).futureValue
+      globalSituation.activeCustomersCount should be >= 2
+      globalSituation.oracleSchemasStatus.keySet should contain allOf (
+        "SA_PERSISTENCE",
+        "SA_FACTS",
+        "SA_GRAPH",
+        "SA_INTELLIGENCE",
+        "SA_DECISIONS",
+        "SA_GOVERNANCE"
+      )
+    }
+
+    "serve loan origination evaluations, projections, Oracle Exadata 6-schema overview, and hierarchy over Pekko HTTP and gRPC endpoints" in {
       import JacksonJsonSupport.given
       given scala.concurrent.ExecutionContext = system.executionContext
       val now = Instant.parse("2026-11-07T16:00:00Z")
@@ -283,9 +406,10 @@ class CustomerSituationAwarenessSpec
         val snapshotDto = Unmarshal(sitResp.entity).to[CustomerSituationSnapshotDto].futureValue
         snapshotDto.customerId shouldBe "CLIENT-HTTP-1"
         snapshotDto.outflow30d shouldBe BigDecimal("1200.00")
+        snapshotDto.stateVersion should be >= 2L
         snapshotDto.riskExposures.map(_.sourceEntityId) should contain("UNLICENSED-LENDER-88")
 
-        // 5. Evaluate loan over gRPC path POST /com.bank.sa.proto.v1.LoanOriginationService/EvaluateLoan
+        // 5. Project loan scenario via POST /api/v1/loans/project
         val loanReq = LoanOriginationRequest(
           applicationId = "LOAN-HTTP-01",
           customerId = "CLIENT-HTTP-1",
@@ -295,6 +419,21 @@ class CustomerSituationAwarenessSpec
           requestedAt = Some(now)
         )
         val loanEntity = Marshal(loanReq).to[RequestEntity].futureValue
+        val projResp = Http()(using system)
+          .singleRequest(
+            HttpRequest(
+              method = HttpMethods.POST,
+              uri = s"$baseUrl/api/v1/loans/project",
+              entity = loanEntity
+            )
+          )
+          .futureValue
+        projResp.status shouldBe StatusCodes.OK
+        val projDto = Unmarshal(projResp.entity).to[SituationProjectionDto].futureValue
+        projDto.customerId shouldBe "CLIENT-HTTP-1"
+        projDto.stateVersion should be >= 2L
+
+        // 6. Evaluate loan over gRPC path POST /com.bank.sa.proto.v1.LoanOriginationService/EvaluateLoan
         val evalResp = Http()(using system)
           .singleRequest(
             HttpRequest(
@@ -310,7 +449,22 @@ class CustomerSituationAwarenessSpec
         decisionDto.adverseActionReasons.map(_.code) should contain("RC_301_DIRECT_RESTRICTED_COUNTERPARTY")
         decisionDto.adverseActionReasons.flatMap(_.evidenceIds) should contain("TX-HTTP-RISK-01")
 
-        // 6. Verify UI HTML endpoint (GET /) and System Overview Telemetry (GET /api/v1/system/overview)
+        // 7. Verify Oracle Exadata 6-Schema Overview (GET /api/v1/oracle/overview) & Agent Hierarchy (GET /api/v1/agents/hierarchy)
+        val oracleResp = Http()(using system)
+          .singleRequest(HttpRequest(uri = s"$baseUrl/api/v1/oracle/overview"))
+          .futureValue
+        oracleResp.status shouldBe StatusCodes.OK
+        val oracleDto = Unmarshal(oracleResp.entity).to[OracleExadataOverviewDto].futureValue
+        oracleDto.schemasRecordCounts.keys should contain("SA_PERSISTENCE")
+        oracleDto.schemasRecordCounts.keys should contain("SA_FACTS")
+        oracleDto.schemasRecordCounts.keys should contain("SA_GRAPH")
+
+        val hierarchyResp = Http()(using system)
+          .singleRequest(HttpRequest(uri = s"$baseUrl/api/v1/agents/hierarchy"))
+          .futureValue
+        hierarchyResp.status shouldBe StatusCodes.OK
+
+        // 8. Verify UI HTML endpoint (GET /) and System Overview Telemetry (GET /api/v1/system/overview)
         val uiResp = Http()(using system).singleRequest(HttpRequest(uri = s"$baseUrl/")).futureValue
         uiResp.status shouldBe StatusCodes.OK
 
@@ -320,8 +474,10 @@ class CustomerSituationAwarenessSpec
         overviewResp.status shouldBe StatusCodes.OK
         val overviewDto = Unmarshal(overviewResp.entity).to[SystemOverviewDto].futureValue
         overviewDto.activeCustomerIds should contain("CLIENT-HTTP-1")
+        overviewDto.registeredEventPlugins should not be empty
         overviewDto.workflowTraces.map(_.stage) should contain("FLINK_ENRICHMENT")
         overviewDto.workflowTraces.map(_.stage) should contain("PEKKO_SHARD_ACTOR")
+        overviewDto.workflowTraces.map(_.stage) should contain("EVENT_PLUGIN_ENGINE")
         overviewDto.workflowTraces.map(_.stage) should contain("EXPLAINABLE_ENGINE")
       finally
         binding.unbind().futureValue
