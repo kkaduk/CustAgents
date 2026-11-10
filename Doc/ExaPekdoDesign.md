@@ -344,7 +344,7 @@ Zamiast tego dostarcza nową wiedzę, którą agenci włączają do swoich stan�
 
 ---
 
-# **6. Model agentów — nie ograniczałbym się do CustomerAgent**
+# **6. Model agentów — nie tylko CustomerAgent**
 
 Z punktu widzenia świadomości sytuacyjnej najważniejszą role pełni `CustomerAgent`. Jest on odpowiedzialny za dostarczenie opisu bieżącej sytuacji danego klienta. Jednak nie każdy agent musi reprezentować klienta. Możemy zastosować bogatszy model agentowy, rozdzielający odpowiedzialności domenowe. Wtedy `CustomerAgent` może korzystać z usług agentów domenowych odpowiedzialnych za informacje lub algorytmy przetwarzania wykorzystywane przez wielu agentów klienta.
 
