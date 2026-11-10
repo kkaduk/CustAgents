@@ -1,6 +1,7 @@
 ThisBuild / version := "0.1.0-SNAPSHOT"
 ThisBuild / scalaVersion := "3.3.4"
 ThisBuild / organization := "com.bank.sa"
+ThisBuild / resolvers += Resolver.mavenLocal
 ThisBuild / scalacOptions ++= Seq(
   "-deprecation",
   "-feature",
@@ -11,6 +12,7 @@ ThisBuild / scalacOptions ++= Seq(
 val pekkoVersion     = "1.1.2"
 val pekkoHttpVersion = "1.1.0"
 val flinkVersion     = "1.19.1"
+val ojdbcVersion     = "23.6.0.24.10"
 val scalatestVersion = "3.2.19"
 val logbackVersion   = "1.5.12"
 
@@ -58,20 +60,20 @@ lazy val customerAgents = (project in file("modules/customer-agents"))
     name := "sa-customer-agents",
     Compile / mainClass := Some("com.bank.sa.app.SituationAwarenessDemo"),
     libraryDependencies ++= Seq(
-      "org.apache.pekko" %% "pekko-actor-typed"            % pekkoVersion,
-      "org.apache.pekko" %% "pekko-stream"                 % pekkoVersion,
-      "org.apache.pekko" %% "pekko-cluster-typed"          % pekkoVersion,
-      "org.apache.pekko" %% "pekko-cluster-sharding-typed" % pekkoVersion,
-      "org.apache.pekko" %% "pekko-persistence-typed"      % pekkoVersion,
-      "org.apache.pekko" %% "pekko-serialization-jackson"  % pekkoVersion,
-      "org.apache.pekko" %% "pekko-http"                   % pekkoHttpVersion,
-      "org.apache.pekko" %% "pekko-slf4j"                  % pekkoVersion,
-      "ch.qos.logback"    % "logback-classic"              % logbackVersion,
-      "org.apache.pekko" %% "pekko-actor-testkit-typed"    % pekkoVersion     % Test,
-      "org.apache.pekko" %% "pekko-stream-testkit"         % pekkoVersion     % Test,
-      "org.apache.pekko" %% "pekko-http-testkit"           % pekkoHttpVersion % Test,
-      "org.apache.pekko" %% "pekko-persistence-testkit"    % pekkoVersion     % Test,
-      "org.scalatest"    %% "scalatest"                    % scalatestVersion % Test
+      "org.apache.pekko"         %% "pekko-actor-typed"            % pekkoVersion,
+      "org.apache.pekko"         %% "pekko-stream"                 % pekkoVersion,
+      "org.apache.pekko"         %% "pekko-cluster-typed"          % pekkoVersion,
+      "org.apache.pekko"         %% "pekko-cluster-sharding-typed" % pekkoVersion,
+      "org.apache.pekko"         %% "pekko-persistence-typed"      % pekkoVersion,
+      "org.apache.pekko"         %% "pekko-serialization-jackson"  % pekkoVersion,
+      "org.apache.pekko"         %% "pekko-http"                   % pekkoHttpVersion,
+      "org.apache.pekko"         %% "pekko-slf4j"                  % pekkoVersion,
+      "com.oracle.database.jdbc"  % "ojdbc11"                      % ojdbcVersion,
+      "ch.qos.logback"            % "logback-classic"              % logbackVersion,
+      "org.apache.pekko"         %% "pekko-actor-testkit-typed"    % pekkoVersion     % Test,
+      "org.apache.pekko"         %% "pekko-stream-testkit"         % pekkoVersion     % Test,
+      "org.apache.pekko"         %% "pekko-http-testkit"           % pekkoHttpVersion % Test,
+      "org.apache.pekko"         %% "pekko-persistence-testkit"    % pekkoVersion     % Test,
+      "org.scalatest"            %% "scalatest"                    % scalatestVersion % Test
     )
   )
-

@@ -14,8 +14,8 @@
 -- -----------------------------------------------------------------------------
 -- 1. SCHEMA: SA_PERSISTENCE (Pekko Persistence JDBC - Slick OracleProfile)
 -- -----------------------------------------------------------------------------
-CREATE USER SA_PERSISTENCE IDENTIFIED BY "Exadata_SA_Persist_2026" QUOTA UNLIMITED ON USERS;
-GRANT CONNECT, RESOURCE TO SA_PERSISTENCE;
+CREATE USER SA_PERSISTENCE IDENTIFIED BY "Exadata_SA_Persist_2026#";
+GRANT CONNECT, RESOURCE, UNLIMITED TABLESPACE TO SA_PERSISTENCE;
 
 CREATE TABLE SA_PERSISTENCE.EVENT_JOURNAL (
     ORDERING             NUMBER(19) GENERATED ALWAYS AS IDENTITY NOT NULL,
@@ -92,8 +92,8 @@ CREATE TABLE SA_PERSISTENCE.AGENT_TRANSACTIONAL_OUTBOX (
 -- -----------------------------------------------------------------------------
 -- 2. SCHEMA: SA_FACTS (Authoritative Financial & Document Facts - Section 4)
 -- -----------------------------------------------------------------------------
-CREATE USER SA_FACTS IDENTIFIED BY "Exadata_SA_Facts_2026" QUOTA UNLIMITED ON USERS;
-GRANT CONNECT, RESOURCE TO SA_FACTS;
+CREATE USER SA_FACTS IDENTIFIED BY "Exadata_SA_Facts_2026#";
+GRANT CONNECT, RESOURCE, UNLIMITED TABLESPACE TO SA_FACTS;
 
 CREATE TABLE SA_FACTS.FINANCIAL_TRANSACTION_FACTS (
     TX_ID                       VARCHAR2(128 CHAR) NOT NULL,
@@ -142,8 +142,8 @@ CREATE TABLE SA_FACTS.DEBT_OBLIGATION_FACTS (
 -- -----------------------------------------------------------------------------
 -- 3. SCHEMA: SA_GRAPH (Oracle Property Graph for Global Relationship Analysis - Section 5)
 -- -----------------------------------------------------------------------------
-CREATE USER SA_GRAPH IDENTIFIED BY "Exadata_SA_Graph_2026" QUOTA UNLIMITED ON USERS;
-GRANT CONNECT, RESOURCE TO SA_GRAPH;
+CREATE USER SA_GRAPH IDENTIFIED BY "Exadata_SA_Graph_2026#";
+GRANT CONNECT, RESOURCE, UNLIMITED TABLESPACE TO SA_GRAPH;
 
 CREATE TABLE SA_GRAPH.GRAPH_VERTICES (
     VERTEX_ID       VARCHAR2(128 CHAR) NOT NULL,
@@ -181,8 +181,8 @@ CREATE TABLE SA_GRAPH.GRAPH_EDGES (
 -- -----------------------------------------------------------------------------
 -- 4. SCHEMA: SA_INTELLIGENCE (Global Risk Signals & Portfolio Analytics - Section 5, 11, 14)
 -- -----------------------------------------------------------------------------
-CREATE USER SA_INTELLIGENCE IDENTIFIED BY "Exadata_SA_Intel_2026" QUOTA UNLIMITED ON USERS;
-GRANT CONNECT, RESOURCE TO SA_INTELLIGENCE;
+CREATE USER SA_INTELLIGENCE IDENTIFIED BY "Exadata_SA_Intel_2026#";
+GRANT CONNECT, RESOURCE, UNLIMITED TABLESPACE TO SA_INTELLIGENCE;
 
 CREATE TABLE SA_INTELLIGENCE.RISK_INTELLIGENCE_EVENTS (
     PATTERN_ID           VARCHAR2(128 CHAR) NOT NULL,
@@ -212,8 +212,8 @@ CREATE TABLE SA_INTELLIGENCE.PORTFOLIO_ANALYTICS_SNAPSHOTS (
 -- -----------------------------------------------------------------------------
 -- 5. SCHEMA: SA_DECISIONS (Persisted Evaluations, Projections & Audit - Section 7, 11, 13)
 -- -----------------------------------------------------------------------------
-CREATE USER SA_DECISIONS IDENTIFIED BY "Exadata_SA_Decisions_2026" QUOTA UNLIMITED ON USERS;
-GRANT CONNECT, RESOURCE TO SA_DECISIONS;
+CREATE USER SA_DECISIONS IDENTIFIED BY "Exadata_SA_Decisions_2026#";
+GRANT CONNECT, RESOURCE, UNLIMITED TABLESPACE TO SA_DECISIONS;
 
 CREATE TABLE SA_DECISIONS.SITUATION_PROJECTION_LOG (
     PROJECTION_ID       VARCHAR2(128 CHAR) NOT NULL,
@@ -247,8 +247,8 @@ CREATE TABLE SA_DECISIONS.DECISION_AUDIT_LOG (
 -- -----------------------------------------------------------------------------
 -- 6. SCHEMA: SA_GOVERNANCE (Rule Versions, Models, Policies & Control Metadata - Section 11, 13)
 -- -----------------------------------------------------------------------------
-CREATE USER SA_GOVERNANCE IDENTIFIED BY "Exadata_SA_Gov_2026" QUOTA UNLIMITED ON USERS;
-GRANT CONNECT, RESOURCE TO SA_GOVERNANCE;
+CREATE USER SA_GOVERNANCE IDENTIFIED BY "Exadata_SA_Gov_2026#";
+GRANT CONNECT, RESOURCE, UNLIMITED TABLESPACE TO SA_GOVERNANCE;
 
 CREATE TABLE SA_GOVERNANCE.GOVERNANCE_POLICY_REGISTRY (
     POLICY_VERSION           VARCHAR2(64 CHAR) NOT NULL,
