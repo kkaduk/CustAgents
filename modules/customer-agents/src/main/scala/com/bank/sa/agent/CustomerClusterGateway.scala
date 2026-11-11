@@ -417,10 +417,19 @@ class CustomerClusterGateway(
       sharding.entityRefFor(PortfolioRiskAgent.TypeKey, segId).ask(replyTo => PortfolioRiskAgent.GetPortfolioSituation(replyTo))
     }
 
+  def getDocumentVerificationStates: Future[List[DocumentVerificationAgentState]] =
+    val cids = knownCustomers.asScala.toList
+    Future.traverse(cids) { cid =>
+      sharding
+        .entityRefFor(DocumentVerificationAgent.TypeKey, cid)
+        .ask(replyTo => DocumentVerificationAgent.GetVerificationState(replyTo))
+    }
+
   def getGlobalBankingSituation(now: Instant = Instant.now()): Future[GlobalBankingSituation] =
     for
       rels       <- getRelationshipStates
       riskState  <- getRiskSignalAgentState
+      docStates  <- getDocumentVerificationStates
       portfolios <- getPortfolioStates
     yield GlobalBankingSituation(
       activeCustomersCount = knownCustomers.size(),
@@ -428,6 +437,9 @@ class CustomerClusterGateway(
       activeRiskSignalsCount = riskState.signals.size,
       verifiedDocumentsCount = oracleRepository.getVerifiedDocumentFacts.size,
       portfolioSegments = portfolios,
+      relationships = rels,
+      riskSignalCoordinator = Some(riskState),
+      documentVerifications = docStates,
       globalGraphVerticesCount = oracleRepository.getGraphVertices.size,
       globalGraphEdgesCount = oracleRepository.getGraphEdges.size,
       detectedGlobalPatterns = oracleRepository.getRiskIntelligenceEvents,
