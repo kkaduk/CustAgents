@@ -5,8 +5,10 @@ import com.bank.sa.engine.ExplainableCreditEngine
 import org.apache.pekko.actor.typed.{ActorRef, Behavior}
 import org.apache.pekko.actor.typed.scaladsl.Behaviors
 import org.apache.pekko.cluster.sharding.typed.scaladsl.EntityTypeKey
-import org.apache.pekko.persistence.typed.PersistenceId
+import org.apache.pekko.persistence.typed.{PersistenceId, RecoveryCompleted}
 import org.apache.pekko.persistence.typed.scaladsl.{Effect, EventSourcedBehavior, RetentionCriteria}
+
+import scala.concurrent.duration.*
 
 /**
  * Callback interface used by a `CustomerAgent` to asynchronously propagate
@@ -22,6 +24,17 @@ trait PeerRiskRouter extends Serializable:
       result: PluginProcessingResult
   ): Unit =
     result.outboxEntries.flatMap(_.peerSignal).foreach { sig =>
+      sendRiskSignal(sig.targetCustomerId, sig)
+    }
+
+  /**
+   * Re-dispatches unacknowledged Transactional Outbox entries upon actor recovery or periodic outbox sweep (Roadmap 9.3).
+   */
+  def retryPendingOutbox(
+      customerId: String,
+      pendingEntries: Iterable[OutboxEntry]
+  ): Unit =
+    pendingEntries.flatMap(_.peerSignal).foreach { sig =>
       sendRiskSignal(sig.targetCustomerId, sig)
     }
 
@@ -100,6 +113,9 @@ object CustomerAgent:
       replyTo: ActorRef[IngestionAck]
   ) extends Command
 
+  /** Periodic timer or manual command to sweep and re-dispatch unacknowledged Transactional Outbox entries (Roadmap 9.3). */
+  case object RetryPendingOutbox extends Command
+
   case object Passivate extends Command
 
   // --- EVENT JOURNAL PROTOCOL (Section 2.1) ---
@@ -132,18 +148,32 @@ object CustomerAgent:
       customerId: String,
       creditEngine: ExplainableCreditEngine,
       peerRiskRouter: PeerRiskRouter = PeerRiskRouter.NoOp,
-      pluginRegistry: EventPluginRegistry = EventPluginRegistry.default
+      pluginRegistry: EventPluginRegistry = EventPluginRegistry.default,
+      outboxSweepInterval: FiniteDuration = 5.seconds
   ): Behavior[Command] =
     Behaviors.setup { context =>
-      EventSourcedBehavior[Command, Event, CustomerSituationState](
-        persistenceId = PersistenceId(TypeKey.name, customerId),
-        emptyState = CustomerSituationState.empty(customerId),
-        commandHandler = (state, command) =>
-          handleCommand(customerId, state, command, creditEngine, peerRiskRouter, pluginRegistry, context.log),
-        eventHandler = (state, event) => handleEvent(state, event, pluginRegistry)
-      ).withRetention(
-        RetentionCriteria.snapshotEvery(numberOfEvents = 50, keepNSnapshots = 2)
-      )
+      Behaviors.withTimers { timers =>
+        timers.startTimerWithFixedDelay("outbox-retry-sweeper", RetryPendingOutbox, outboxSweepInterval)
+
+        EventSourcedBehavior[Command, Event, CustomerSituationState](
+          persistenceId = PersistenceId(TypeKey.name, customerId),
+          emptyState = CustomerSituationState.empty(customerId),
+          commandHandler = (state, command) =>
+            handleCommand(customerId, state, command, creditEngine, peerRiskRouter, pluginRegistry, context.log),
+          eventHandler = (state, event) => handleEvent(state, event, pluginRegistry)
+        ).withRetention(
+          RetentionCriteria.snapshotEvery(numberOfEvents = 50, keepNSnapshots = 2)
+        ).receiveSignal {
+          case (state, RecoveryCompleted) =>
+            if state.pendingOutbox.nonEmpty then
+              context.log.info(
+                "[CustomerAgent:{}] RecoveryCompleted with {} pending outbox entries; triggering reliable re-dispatch.",
+                customerId,
+                state.pendingOutbox.size
+              )
+              peerRiskRouter.retryPendingOutbox(customerId, state.pendingOutbox.values)
+        }
+      }
     }
 
   private def handleCommand(
@@ -222,6 +252,12 @@ object CustomerAgent:
         Effect
           .persist(CustomerStateReset(customerId))
           .thenReply(replyTo)(_ => IngestionAck(customerId, "STATE-RESET"))
+
+      case RetryPendingOutbox =>
+        if state.pendingOutbox.nonEmpty then
+          log.debug("[CustomerAgent:{}] Sweeping {} unacknowledged outbox entries.", customerId, state.pendingOutbox.size)
+          peerRiskRouter.retryPendingOutbox(customerId, state.pendingOutbox.values)
+        Effect.none
 
       case Passivate =>
         Effect.stop()

@@ -5,9 +5,9 @@ import org.slf4j.LoggerFactory
 
 import java.sql.{Connection, DriverManager, Timestamp}
 import java.time.Instant
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ConcurrentLinkedDeque
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedDeque, LinkedBlockingQueue}
 import java.util.concurrent.atomic.AtomicLong
+import scala.collection.mutable.ListBuffer
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
 import scala.util.control.NonFatal
@@ -23,7 +23,8 @@ final case class OracleJdbcConfig(
     user: String =
       sys.env.get("ORACLE_USER").orElse(sys.props.get("oracle.user")).getOrElse("SYSTEM"),
     password: String =
-      sys.env.get("ORACLE_PASSWORD").orElse(sys.props.get("oracle.password")).getOrElse("PKO_666#")
+      sys.env.get("ORACLE_PASSWORD").orElse(sys.props.get("oracle.password")).getOrElse("PKO_666#"),
+    maxPoolSize: Int = 8
 )
 
 /**
@@ -128,6 +129,9 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
   // 6. SA_GOVERNANCE (Rule Versions, Models, Policies)
   private val governancePolicies   = new ConcurrentHashMap[String, GovernancePolicyRow]()
 
+  // Bounded JDBC Connection Pool (Roadmap 9.1: avoids DriverManager.getConnection per event)
+  private val connectionPool       = new LinkedBlockingQueue[Connection](math.max(1, jdbcConfig.maxPoolSize))
+
   @volatile private var jdbcConnectionReady: Boolean = false
 
   if jdbcConfig.enabled then
@@ -148,17 +152,52 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
     )
   )
 
+  private def acquirePooledConnection(): Connection =
+    val pooled = connectionPool.poll()
+    if pooled != null then
+      try
+        if !pooled.isClosed && pooled.isValid(2) then pooled
+        else
+          try pooled.close()
+          catch case NonFatal(_) => ()
+          DriverManager.getConnection(jdbcConfig.jdbcUrl, jdbcConfig.user, jdbcConfig.password)
+      catch
+        case NonFatal(_) =>
+          DriverManager.getConnection(jdbcConfig.jdbcUrl, jdbcConfig.user, jdbcConfig.password)
+    else
+      DriverManager.getConnection(jdbcConfig.jdbcUrl, jdbcConfig.user, jdbcConfig.password)
+
+  private def releasePooledConnection(conn: Connection): Unit =
+    if conn != null then
+      try
+        if !conn.isClosed && !connectionPool.offer(conn) then conn.close()
+      catch
+        case NonFatal(_) =>
+          try conn.close()
+          catch case NonFatal(_) => ()
+
+  def closeConnectionPool(): Unit =
+    var conn = connectionPool.poll()
+    while conn != null do
+      try conn.close()
+      catch case NonFatal(_) => ()
+      conn = connectionPool.poll()
+
+  def pooledIdleConnectionsCount: Int = connectionPool.size()
+
   private def withJdbcConnection[A](f: Connection => A): Option[A] =
     if !jdbcConfig.enabled || !jdbcConnectionReady then None
     else
+      var conn: Connection = null
       try
-        Using.resource(DriverManager.getConnection(jdbcConfig.jdbcUrl, jdbcConfig.user, jdbcConfig.password)) { conn =>
-          Some(f(conn))
-        }
+        conn = acquirePooledConnection()
+        Some(f(conn))
       catch
         case NonFatal(ex) =>
           log.warn("Oracle JDBC operation warning: {}", ex.getMessage)
           None
+      finally
+        releasePooledConnection(conn)
 
   private def execDdlIgnoreExists(conn: Connection, sql: String): Unit =
     try
@@ -326,12 +365,22 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
             |  ACTIVE_FLAG NUMBER(1) DEFAULT 1 NOT NULL,
             |  REGISTERED_AT TIMESTAMP WITH TIME ZONE NOT NULL,
             |  CONSTRAINT PK_SA_GOV_POLICY PRIMARY KEY (POLICY_VERSION)
-            |)""".stripMargin
+            |)""".stripMargin,
+          """CREATE PROPERTY GRAPH SA_GRAPH.SA_GLOBAL_RELATIONSHIP_GRAPH
+            |  VERTEX TABLES (
+            |    SA_GRAPH.GRAPH_VERTICES KEY (VERTEX_ID) PROPERTIES ARE ALL COLUMNS
+            |  )
+            |  EDGE TABLES (
+            |    SA_GRAPH.GRAPH_EDGES KEY (EDGE_ID)
+            |      SOURCE KEY (SOURCE_VERTEX_ID) REFERENCES GRAPH_VERTICES (VERTEX_ID)
+            |      DESTINATION KEY (TARGET_VERTEX_ID) REFERENCES GRAPH_VERTICES (VERTEX_ID)
+            |      PROPERTIES ARE ALL COLUMNS
+            |  )""".stripMargin
         )
 
         ddlStatements.foreach(sql => execDdlIgnoreExists(conn, sql))
         jdbcConnectionReady = true
-        log.info("Oracle Exadata 6-Schema initialization complete (SA_PERSISTENCE, SA_FACTS, SA_GRAPH, SA_INTELLIGENCE, SA_DECISIONS, SA_GOVERNANCE).")
+        log.info("Oracle Exadata 6-Schema + SQL Property Graph initialization complete.")
       }
     catch
       case NonFatal(ex) =>
@@ -349,37 +398,54 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
       payloadSummary: String,
       timestamp: Instant = Instant.now()
   ): OracleJournalRow =
-    val seq = nextSeq(persistenceId)
-    val row = OracleJournalRow(
-      persistenceId = persistenceId,
-      sequenceNr = seq,
-      eventType = eventType,
-      eventPayloadSummary = payloadSummary,
-      eventTimestamp = timestamp,
-      eventSchemaVersion = 1
-    )
-    persistenceJournal.addFirst(row)
-    while persistenceJournal.size() > 500 do persistenceJournal.removeLast()
+    appendJournalEventsBatch(persistenceId, List((eventType, payloadSummary, timestamp))).head
 
-    withJdbcConnection { conn =>
-      val sql =
-        """MERGE INTO SA_PERSISTENCE.AGENT_EVENT_JOURNAL t
-          |USING (SELECT ? AS pid, ? AS seq FROM dual) s
-          |ON (t.PERSISTENCE_ID = s.pid AND t.SEQUENCE_NR = s.seq)
-          |WHEN NOT MATCHED THEN INSERT (PERSISTENCE_ID, SEQUENCE_NR, EVENT_TYPE, EVENT_PAYLOAD, EVENT_TIMESTAMP, EVENT_SCHEMA_VERSION)
-          |VALUES (?, ?, ?, ?, ?, 1)""".stripMargin
-      Using.resource(conn.prepareStatement(sql)) { ps =>
-        ps.setString(1, row.persistenceId)
-        ps.setLong(2, row.sequenceNr)
-        ps.setString(3, row.persistenceId)
-        ps.setLong(4, row.sequenceNr)
-        ps.setString(5, row.eventType)
-        ps.setString(6, row.eventPayloadSummary.take(1900))
-        ps.setTimestamp(7, Timestamp.from(row.eventTimestamp))
-        ps.executeUpdate()
-      }
+  /**
+   * Batched JDBC journal append (`PreparedStatement.addBatch` / `executeBatch`, Roadmap 9.1).
+   * Persists multiple journal events (e.g., `ObservedEventPersisted` + `SituationEvaluated`) in a single Oracle round-trip.
+   */
+  def appendJournalEventsBatch(
+      persistenceId: String,
+      events: Seq[(String, String, Instant)]
+  ): List[OracleJournalRow] =
+    val rows = events.toList.map { case (eventType, payloadSummary, timestamp) =>
+      val seq = nextSeq(persistenceId)
+      val row = OracleJournalRow(
+        persistenceId = persistenceId,
+        sequenceNr = seq,
+        eventType = eventType,
+        eventPayloadSummary = payloadSummary,
+        eventTimestamp = timestamp,
+        eventSchemaVersion = 1
+      )
+      persistenceJournal.addFirst(row)
+      while persistenceJournal.size() > 500 do persistenceJournal.removeLast()
+      row
     }
-    row
+
+    if rows.nonEmpty then
+      withJdbcConnection { conn =>
+        val sql =
+          """MERGE INTO SA_PERSISTENCE.AGENT_EVENT_JOURNAL t
+            |USING (SELECT ? AS pid, ? AS seq FROM dual) s
+            |ON (t.PERSISTENCE_ID = s.pid AND t.SEQUENCE_NR = s.seq)
+            |WHEN NOT MATCHED THEN INSERT (PERSISTENCE_ID, SEQUENCE_NR, EVENT_TYPE, EVENT_PAYLOAD, EVENT_TIMESTAMP, EVENT_SCHEMA_VERSION)
+            |VALUES (?, ?, ?, ?, ?, 1)""".stripMargin
+        Using.resource(conn.prepareStatement(sql)) { ps =>
+          rows.foreach { row =>
+            ps.setString(1, row.persistenceId)
+            ps.setLong(2, row.sequenceNr)
+            ps.setString(3, row.persistenceId)
+            ps.setLong(4, row.sequenceNr)
+            ps.setString(5, row.eventType)
+            ps.setString(6, row.eventPayloadSummary.take(1900))
+            ps.setTimestamp(7, Timestamp.from(row.eventTimestamp))
+            ps.addBatch()
+          }
+          ps.executeBatch()
+        }
+      }
+    rows
 
   def saveBoundedSnapshot(persistenceId: String, state: CustomerSituationState): OracleSnapshotRow =
     val seq = seqCounters.getOrDefault(persistenceId, new AtomicLong(1000L)).get()
@@ -685,15 +751,84 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
     }
 
   /**
-   * Executes Global Relationship Graph Analysis on Oracle Exadata (`SA_GRAPH` -> `SA_INTELLIGENCE`, Section 5 & 14).
+   * Native Oracle 23ai/26ai ISO SQL/PGQ `GRAPH_TABLE` query pushing multi-customer hub convergence detection
+   * down to Oracle Exadata (`SA_GRAPH.SA_GLOBAL_RELATIONSHIP_GRAPH`, Roadmap 9.6).
+   */
+  val GlobalGraphPgqSql: String =
+    """SELECT shared_entity_id,
+      |       COUNT(DISTINCT customer_id) AS linked_customers_count,
+      |       LISTAGG(DISTINCT customer_id, ',') WITHIN GROUP (ORDER BY customer_id) AS linked_customers,
+      |       MAX(intrinsic_risk) AS max_risk_score,
+      |       SUM(total_volume) AS sum_volume,
+      |       LISTAGG(evidence_tx_ids, ',') WITHIN GROUP (ORDER BY customer_id) AS combined_evidence
+      |FROM GRAPH_TABLE (
+      |  SA_GRAPH.SA_GLOBAL_RELATIONSHIP_GRAPH
+      |  MATCH (c IS GRAPH_VERTICES WHERE c.VERTEX_TYPE = 'BANK_CUSTOMER')
+      |        -[e IS GRAPH_EDGES]->
+      |        (hub IS GRAPH_VERTICES)
+      |  COLUMNS (
+      |    c.VERTEX_ID AS customer_id,
+      |    hub.VERTEX_ID AS shared_entity_id,
+      |    hub.INTRINSIC_RISK AS intrinsic_risk,
+      |    e.TOTAL_VOLUME AS total_volume,
+      |    e.EVIDENCE_TX_IDS AS evidence_tx_ids
+      |  )
+      |)
+      |GROUP BY shared_entity_id
+      |HAVING COUNT(DISTINCT customer_id) >= 2
+      |   AND (MAX(intrinsic_risk) >= 0.50 OR SUM(total_volume) >= 1000)""".stripMargin
+
+  private def analyzeGlobalGraphViaSqlPushdown(conn: Connection, now: Instant): List[NetworkRiskPatternDetected] =
+    val results = ListBuffer.empty[NetworkRiskPatternDetected]
+    Using.resource(conn.prepareStatement(GlobalGraphPgqSql)) { ps =>
+      Using.resource(ps.executeQuery()) { rs =>
+        while rs.next() do
+          val counterpartyId    = rs.getString("shared_entity_id")
+          val linkedCustStr     = Option(rs.getString("linked_customers")).getOrElse("")
+          val distinctCustomers = linkedCustStr.split(",").map(_.trim).filter(_.nonEmpty).distinct.toList
+          val rawScore          = rs.getDouble("max_risk_score")
+          val baseScore         = if rawScore > 0.0 then rawScore else 0.55
+          val patternScore      = BigDecimal(math.min(0.95, baseScore)).setScale(4, BigDecimal.RoundingMode.HALF_UP).toDouble
+          val evRaw             = Option(rs.getString("combined_evidence")).getOrElse("")
+          val allEvidence       = evRaw.split(",").map(_.trim).filter(_.nonEmpty).distinct.toList
+
+          distinctCustomers.foreach { affectedCust =>
+            val pattern = NetworkRiskPatternDetected(
+              patternId = s"PAT-GLOBAL-${counterpartyId.replaceAll("[^A-Za-z0-9]", "")}-${affectedCust.replaceAll("[^A-Za-z0-9]", "")}",
+              patternType =
+                if distinctCustomers.size >= 3 then NetworkRiskPatternType.HighDegreeNodeExposure
+                else NetworkRiskPatternType.SharedHighRiskCounterparty,
+              affectedCustomerId = affectedCust,
+              sharedEntityId = counterpartyId,
+              linkedCustomers = distinctCustomers,
+              riskScore = patternScore,
+              reasonCode = "RC_303_GLOBAL_GRAPH_SHARED_CLUSTER",
+              description =
+                s"Global Property Graph (SQL/PGQ GRAPH_TABLE) detected ${distinctCustomers.size} bank accounts (${distinctCustomers.mkString(", ")}) converging on shared counterparty '$counterpartyId'",
+              evidenceIds = allEvidence,
+              detectedAt = now
+            )
+            results += pattern
+          }
+      }
+    }
+    results.toList
+
+  /**
+   * Executes Global Relationship Graph Analysis on Oracle Exadata (`SA_GRAPH` -> `SA_INTELLIGENCE`, Section 5, 14 & Roadmap 9.6).
+   * When connected to Oracle 23ai/26ai JDBC, attempts native `GRAPH_TABLE` SQL/PGQ pushdown first,
+   * and merges with in-memory graph analysis.
    */
   def analyzeGlobalGraphAndDetectPatterns(now: Instant = Instant.now()): List[NetworkRiskPatternDetected] =
+    val pgqDetected: List[NetworkRiskPatternDetected] =
+      withJdbcConnection(conn => analyzeGlobalGraphViaSqlPushdown(conn, now)).getOrElse(Nil)
+
     val allEdges    = graphEdges.values().asScala.toList
     val allVertices = graphVertices.asScala.toMap
 
     val byCounterparty: Map[String, List[GraphEdge]] = allEdges.groupBy(_.targetVertexId)
 
-    val detectedPatterns = byCounterparty.toList.flatMap { case (counterpartyId, incomingEdges) =>
+    val inMemPatterns = byCounterparty.toList.flatMap { case (counterpartyId, incomingEdges) =>
       val distinctCustomers = incomingEdges
         .map(_.sourceVertexId)
         .filter(vid => allVertices.get(vid).exists(_.vertexType == "BANK_CUSTOMER"))
@@ -708,7 +843,7 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
         val allEvidence  = incomingEdges.flatMap(_.evidenceTxIds).distinct
 
         distinctCustomers.map { affectedCust =>
-          val pattern = NetworkRiskPatternDetected(
+          NetworkRiskPatternDetected(
             patternId = s"PAT-GLOBAL-${counterpartyId.replaceAll("[^A-Za-z0-9]", "")}-${affectedCust.replaceAll("[^A-Za-z0-9]", "")}",
             patternType =
               if distinctCustomers.size >= 3 then NetworkRiskPatternType.HighDegreeNodeExposure
@@ -723,13 +858,13 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
             evidenceIds = allEvidence,
             detectedAt = now
           )
-          recordRiskIntelligenceEvent(pattern)
-          pattern
         }
       else Nil
     }
 
-    detectedPatterns
+    val combined = (pgqDetected ++ inMemPatterns).distinctBy(p => (p.patternId, p.affectedCustomerId))
+    combined.foreach(recordRiskIntelligenceEvent)
+    combined
 
   // --- 4. SA_INTELLIGENCE OPERATIONS ---
 

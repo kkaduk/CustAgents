@@ -109,6 +109,26 @@ final case class RiskSignalAgentState(
         )
       case None => this
 
+object RiskSignalAgentState:
+  /** Number of sharded RiskSignalAgent coordinators across the cluster (Roadmap 9.2). */
+  val CoordinatorShardCount: Int = 16
+
+  def coordinatorKeyFor(signalId: String): String =
+    val bucket = math.abs(CustomerSituationState.digest64(signalId).toInt % CoordinatorShardCount)
+    s"RISK-SIGNAL-SHARD-$bucket"
+
+  def mergeShards(agentKey: String, shards: Iterable[RiskSignalAgentState]): RiskSignalAgentState =
+    shards.foldLeft(RiskSignalAgentState(agentKey = agentKey)) { (acc, shard) =>
+      val latest = if shard.lastUpdatedAt.isAfter(acc.lastUpdatedAt) then shard.lastUpdatedAt else acc.lastUpdatedAt
+      RiskSignalAgentState(
+        agentKey = agentKey,
+        signals = acc.signals ++ shard.signals,
+        deliveredCount = acc.deliveredCount + shard.deliveredCount,
+        deduplicatedCount = acc.deduplicatedCount + shard.deduplicatedCount,
+        lastUpdatedAt = latest
+      )
+    }
+
 /**
  * State maintained by `DocumentVerificationAgent` (Section 6):
  * Coordinates verification of external documents (payslips, tax returns, external debt obligations, KYC)
@@ -165,7 +185,8 @@ final case class PortfolioSituationState(
     segmentId: String,
     customers: Map[String, CustomerPortfolioEntry] = Map.empty,
     detectedGlobalPatterns: List[NetworkRiskPatternDetected] = Nil,
-    lastUpdatedAt: Instant = Instant.EPOCH
+    lastUpdatedAt: Instant = Instant.EPOCH,
+    maxRetainedCustomers: Int = PortfolioSituationState.MaxRetainedCustomerEntries
 ) extends Serializable:
 
   def updateCustomerEntry(state: CustomerSituationState): PortfolioSituationState =
@@ -178,8 +199,18 @@ final case class PortfolioSituationState(
       completenessScore = state.dataCompleteness.score,
       updatedAt = state.lastUpdatedAt
     )
+    val rawUpdated = customers.updated(state.customerId, entry)
+    val boundedCustomers =
+      if rawUpdated.size <= maxRetainedCustomers then rawUpdated
+      else
+        rawUpdated.valuesIterator.toList
+          .sortBy(c => (-c.maxRiskScore, -c.updatedAt.toEpochMilli))
+          .take(maxRetainedCustomers)
+          .map(c => c.customerId -> c)
+          .toMap
+
     copy(
-      customers = customers.updated(state.customerId, entry),
+      customers = boundedCustomers,
       lastUpdatedAt = if state.lastUpdatedAt.isAfter(lastUpdatedAt) then state.lastUpdatedAt else lastUpdatedAt
     )
 
@@ -201,6 +232,29 @@ final case class PortfolioSituationState(
   def averageMonthlyIncome: BigDecimal =
     if customers.isEmpty then BigDecimal(0)
     else (customers.valuesIterator.map(_.monthlyIncome).sum / BigDecimal(customers.size)).setScale(2, BigDecimal.RoundingMode.HALF_UP)
+
+object PortfolioSituationState:
+  /** Number of sub-segment shards per banking portfolio segment (Roadmap 9.2). */
+  val SubSegmentShardCount: Int = 8
+
+  /** Maximum customer summary entries retained in a single sub-segment shard (Roadmap 9.2). */
+  val MaxRetainedCustomerEntries: Int = 500
+
+  def subSegmentKeyFor(segmentId: String, customerId: String): String =
+    val bucket = math.abs(CustomerSituationState.digest64(customerId).toInt % SubSegmentShardCount)
+    s"$segmentId#SHARD-$bucket"
+
+  def mergeSubSegments(segmentId: String, shards: Iterable[PortfolioSituationState]): PortfolioSituationState =
+    shards.foldLeft(PortfolioSituationState(segmentId = segmentId)) { (acc, shard) =>
+      val latest = if shard.lastUpdatedAt.isAfter(acc.lastUpdatedAt) then shard.lastUpdatedAt else acc.lastUpdatedAt
+      val mergedPatterns = (shard.detectedGlobalPatterns ++ acc.detectedGlobalPatterns).distinctBy(_.patternId).take(50)
+      PortfolioSituationState(
+        segmentId = segmentId,
+        customers = acc.customers ++ shard.customers,
+        detectedGlobalPatterns = mergedPatterns,
+        lastUpdatedAt = latest
+      )
+    }
 
 /**
  * Global Property Graph Vertex and Edge models stored in Oracle Exadata `SA_GRAPH` (Section 5 & 11).

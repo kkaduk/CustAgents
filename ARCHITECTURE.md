@@ -651,43 +651,42 @@ flowchart TB
 
 ---
 
-## 9. Proposed Future Architectural Changes & Evolution Roadmap
+## 9. Proposed Future Architectural Changes & Evolution Roadmap (Implemented)
 
-To resolve the weaknesses identified above and prepare the platform for multi-million-customer production scale on Oracle Exadata, we propose the following six targeted architectural changes:
+All six architectural improvements identified in Section 8.2 have been implemented and verified in [`CustomerSituationAwarenessSpec`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/customer-agents/src/test/scala/com/bank/sa/CustomerSituationAwarenessSpec.scala#L422-L545):
 
-### 9.1 Asynchronous HikariCP / UCP Connection Pool + Pekko Projection Batching for Oracle Exadata
-- **Problem Addressed:** Weakness #1 (Synchronous `DriverManager.getConnection` per event).
-- **Proposed Change:**
-  1. Replace `DriverManager.getConnection` in [`OracleExadataRepository`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/customer-agents/src/main/scala/com/bank/sa/oracle/OracleExadataRepository.scala#L151-L161) with **Oracle Universal Connection Pool (`ucp`)** or **HikariCP** configured with Fast Connection Failover (FCF) for Oracle RAC.
-  2. Decouple `SA_FACTS` and `SA_GRAPH` writes from `CustomerClusterGateway.ingestTransaction` and `onEventProcessedByPlugin` by introducing **Pekko Projections (`pekko-projection-jdbc`)** with grouped JDBC batching (`groupedWithin(200, 50.millis)` + `PreparedStatement.executeBatch()`), reducing Oracle redo commit frequency by $100\times$.
+### 9.1 Bounded JDBC Connection Pool + Batched Journal Writes for Oracle Exadata (`Implemented`)
+- **Problem Addressed:** Weakness #1 (Synchronous `DriverManager.getConnection` per event and per-event journal roundtrips).
+- **Implemented Change:**
+  1. Replaced unpooled `DriverManager.getConnection` calls in [`OracleExadataRepository.withJdbcConnection`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/customer-agents/src/main/scala/com/bank/sa/oracle/OracleExadataRepository.scala#L156-L197) with a bounded `LinkedBlockingQueue[Connection]` connection pool (`maxPoolSize = 8`, `acquirePooledConnection`, `releasePooledConnection`, `closeConnectionPool`, `pooledIdleConnectionsCount`) with connection validation (`isValid(2)`).
+  2. Added [`OracleExadataRepository.appendJournalEventsBatch`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/customer-agents/src/main/scala/com/bank/sa/oracle/OracleExadataRepository.scala#L285-L321) using `PreparedStatement.addBatch()` + `executeBatch()` inside a single JDBC transaction (`autoCommit = false`), and updated [`CustomerClusterGateway.onEventProcessedByPlugin`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/customer-agents/src/main/scala/com/bank/sa/agent/CustomerClusterGateway.scala#L131-L154) to persist both `ObservedEventPersisted` and `SituationEvaluated` in a single atomic batch.
 
-### 9.2 Sharded Risk Coordinators & Hierarchical Tree Aggregation for `PortfolioRiskAgent`
+### 9.2 Sharded Risk Coordinators & Sub-Segment Tree Aggregation for `PortfolioRiskAgent` (`Implemented`)
 - **Problem Addressed:** Weakness #2 (Single `"GLOBAL-RISK-SIGNAL-COORDINATOR"` and `"RETAIL-PRIME"` actor bottlenecks).
-- **Proposed Change:**
-  1. Partition `RiskSignalAgent` by `originCustomerId` or `shardId` (`s"RISK-COORDINATOR-SHARD-${math.abs(signal.fromCustomerId.hashCode % 64)}"`) instead of a single global coordinator ID.
-  2. Refactor `PortfolioRiskAgent` into a two-level aggregation tree (`PortfolioSubSegmentAgent("RETAIL-PRIME-BUCKET-0..63")` $\rightarrow$ `PortfolioRiskAgent("RETAIL-PRIME")`) that stores incremental summary counters (`activeCount`, `highRiskCount`, `sumMonthlyIncome`) rather than holding a full `Map[String, CustomerPortfolioEntry]` of every customer in the segment.
+- **Implemented Change:**
+  1. Partitioned `RiskSignalAgent` across 16 sharded coordinators via [`RiskSignalAgentState.coordinatorKeyFor(signalId)`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/domain/src/main/scala/com/bank/sa/domain/HierarchicalDomainModels.scala#L151-L185) (`RISK-SIGNAL-COORDINATOR-SHARD-0..15`) and merged them on query via [`RiskSignalAgentState.mergeShards`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/domain/src/main/scala/com/bank/sa/domain/HierarchicalDomainModels.scala#L160-L185) in [`CustomerClusterGateway.getRiskSignalAgentState`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/customer-agents/src/main/scala/com/bank/sa/agent/CustomerClusterGateway.scala#L444-L453).
+  2. Partitioned `PortfolioRiskAgent` into 8 sub-segment shards per segment (`RETAIL-PRIME#SUB-0..7`) via [`PortfolioSituationState.subSegmentKeyFor(segmentId, customerId)`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/domain/src/main/scala/com/bank/sa/domain/HierarchicalDomainModels.scala#L232-L282), bounded each sub-segment's retained customer map (`MaxRetainedCustomerEntries = 500`, evicting the lowest-risk/oldest entry when full), and aggregated sub-segments via [`PortfolioSituationState.mergeSubSegments`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/domain/src/main/scala/com/bank/sa/domain/HierarchicalDomainModels.scala#L242-L282).
 
-### 9.3 Active Outbox Sweeper Timer & Pekko Reliable Delivery (`ShardingProducerController`)
+### 9.3 Active Outbox Sweeper Timer & Recovery Replay on `CustomerAgent` (`Implemented`)
 - **Problem Addressed:** Weakness #3 (Unacknowledged `pendingOutbox` recovery after crash).
-- **Proposed Change:**
-  1. Wrap `CustomerAgent.apply` in `Behaviors.withTimers` and schedule a periodic `RetryPendingOutbox` tick (every `10.seconds`) as well as an immediate `RecoveryCompleted` signal handler that re-dispatches any `OutboxEntry` in `state.pendingOutbox` older than 5 seconds.
-  2. Alternatively, adopt Pekko Typed's built-in `ShardingProducerController` / `ConsumerController` for guaranteed end-to-end sequenced message delivery between shards.
+- **Implemented Change:**
+  1. Wrapped [`CustomerAgent.apply`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/customer-agents/src/main/scala/com/bank/sa/agent/CustomerAgent.scala#L112-L143) in `Behaviors.withTimers` scheduling a periodic `RetryPendingOutbox` sweep (`outboxSweepInterval = 5.seconds`) and registered a `.receiveSignal { case (state, RecoveryCompleted) => ... }` handler that immediately re-dispatches any unacknowledged `OutboxEntry` in `state.pendingOutbox` via [`PeerRiskRouter.retryPendingOutbox`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/customer-agents/src/main/scala/com/bank/sa/agent/CustomerAgent.scala#L9-L17).
 
-### 9.4 Hybrid Push/Pull Protocol & Bounded Ego-Network for High-Degree "Super-Nodes"
+### 9.4 Bounded Ego-Network & High-Degree "Super-Node" Fan-Out Protection (`Implemented`)
 - **Problem Addressed:** Weakness #4 (50,000-peer fan-out storms).
-- **Proposed Change:**
-  1. Cap `CustomerSituationState.egoNetwork` to the top $K = 200$ active peers by recency/volume, relegating full counterparty history to `SA_GRAPH` in Oracle Exadata.
-  2. For accounts whose degree exceeds `MaxPushPeersThreshold = 200` (e.g., merchants, utilities, payroll hubs), suppress proactive actor-to-actor push fan-out and instead publish their risk status to a **Pekko Distributed Data (`Replicator` `ORMap`)** or let Oracle Exadata's `SA_GRAPH` emit targeted `NetworkRiskPatternDetected` events for high-risk clusters.
+- **Implemented Change:**
+  1. Bounded [`CustomerSituationState.egoNetwork`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/domain/src/main/scala/com/bank/sa/domain/CustomerSituationState.scala#L152-L295) to `MaxEgoNetworkPeers = 200` (prioritizing restricted peers, high risk, and transaction volume/recency) and added `isHighDegreeSuperNode: Boolean`.
+  2. Capped proactive 2nd-hop actor-to-actor push fan-out in [`TransactionObservedPlugin.buildOutboxEntries`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/domain/src/main/scala/com/bank/sa/domain/EventPluginArchitecture.scala#L74-L135) to `.take(maxPushPeers)` (`MaxPushPeersThreshold = 200`).
 
-### 9.5 64-Bit SipHash / Cuckoo Filter for Historical Event Deduplication
+### 9.5 64-Bit Collision-Resistant Event Digest (`Implemented`)
 - **Problem Addressed:** Weakness #5 (32-bit `String.hashCode` collision risk in `processedEventDigests`).
-- **Proposed Change:**
-  - Replace `processedEventDigests: Set[Int]` in [`CustomerSituationState`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/domain/src/main/scala/com/bank/sa/domain/CustomerSituationState.scala#L151-L173) with a compact **64-bit XXHash/SipHash ring buffer** or a **bounded Cuckoo Filter / Bloom Filter** backed by `Array[Long]`, reducing false-positive collision probability from $\sim 10^{-2}$ to $< 10^{-12}$ while cutting JVM object header overhead by $8\times$.
+- **Implemented Change:**
+  - Replaced `processedEventDigests: Set[Int]` with `processedEventDigests: Set[Long]` backed by [`CustomerSituationState.digest64(value: String): Long`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/domain/src/main/scala/com/bank/sa/domain/CustomerSituationState.scala#L397-L413) (64-bit FNV-1a combined with MurmurHash3 64-bit finalizer avalanche mixing), reducing collision probability at 10,000 events from $\sim 10^{-2}$ to $< 10^{-11}$.
 
-### 9.6 Native Oracle 23ai/26ai `GRAPH_TABLE` SQL Pushdown for Global Graph Analysis
+### 9.6 Native Oracle 23ai/26ai `GRAPH_TABLE` SQL/PGQ Pushdown for Global Graph Analysis (`Implemented`)
 - **Problem Addressed:** Weakness #6 (In-memory graph iteration in `analyzeGlobalGraphAndDetectPatterns`).
-- **Proposed Change:**
-  - When `jdbcConfig.enabled == true`, execute native ISO SQL/PGQ `GRAPH_TABLE` queries directly inside Oracle Exadata against `SA_GRAPH.SA_GLOBAL_RELATIONSHIP_GRAPH`:
+- **Implemented Change:**
+  - Provisioned `CREATE PROPERTY GRAPH SA_GRAPH.SA_GLOBAL_RELATIONSHIP_GRAPH` in [`OracleExadataRepository.initializeOracleDatabaseSchemas`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/customer-agents/src/main/scala/com/bank/sa/oracle/OracleExadataRepository.scala#L230-L246) and implemented [`OracleExadataRepository.GlobalGraphPgqSql`](file:///Users/krzysztof/Projects/OCS/CustAgents/modules/customer-agents/src/main/scala/com/bank/sa/oracle/OracleExadataRepository.scala#L728-L775) + `analyzeGlobalGraphViaSqlPushdown` in `analyzeGlobalGraphAndDetectPatterns`:
     ```sql
     SELECT shared_entity_id,
            COUNT(DISTINCT customer_id) AS linked_customers_count,

@@ -46,7 +46,10 @@ trait SituationEventPlugin extends Serializable:
  * Updates sliding-window cashflow buckets, Ego-Network connections, 1st-hop restricted exposure,
  * and creates Transactional Outbox entries for 2nd-hop peer risk propagation and RelationshipAgent updates.
  */
-class TransactionObservedPlugin(secondHopAttenuation: Double = 0.65) extends SituationEventPlugin:
+class TransactionObservedPlugin(
+    secondHopAttenuation: Double = 0.65,
+    maxPushPeers: Int = CustomerSituationState.MaxPushPeersThreshold
+) extends SituationEventPlugin:
   override val pluginId: String           = "plugin.sa.transaction-observed.v1"
   override val supportedEventType: String = "TransactionObserved"
 
@@ -101,6 +104,7 @@ class TransactionObservedPlugin(secondHopAttenuation: Double = 0.65) extends Sit
 
         updatedState.connectedBankPeers
           .filterNot(_.counterpartyId == customerId)
+          .take(maxPushPeers)
           .map { peerConn =>
             val outboxId = s"OUTBOX-SIG-${tx.txId}-TO-${peerConn.counterpartyId}"
             val signal = PeerRiskSignal(

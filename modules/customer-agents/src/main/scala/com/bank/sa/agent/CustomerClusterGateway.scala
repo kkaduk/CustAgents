@@ -37,14 +37,17 @@ class CustomerClusterGateway(
   private given ExecutionContext = system.executionContext
   private val sharding           = ClusterSharding(system)
 
-  private val seqCounter         = new AtomicLong(0L)
-  private val knownCustomers     = new ConcurrentSkipListSet[String]()
-  private val knownRelationships = new ConcurrentSkipListSet[String]()
-  private val knownSegments      = new ConcurrentSkipListSet[String]()
-  private val workflowTraces     = new ConcurrentLinkedDeque[WorkflowTraceEventDto]()
-  private val recentDecisions    = new ConcurrentLinkedDeque[LoanOriginationDecisionDto]()
+  private val seqCounter            = new AtomicLong(0L)
+  private val knownCustomers        = new ConcurrentSkipListSet[String]()
+  private val knownRelationships    = new ConcurrentSkipListSet[String]()
+  private val knownSegments         = new ConcurrentSkipListSet[String]()
+  private val knownSubSegments      = new ConcurrentSkipListSet[String]()
+  private val knownRiskCoordinators = new ConcurrentSkipListSet[String]()
+  private val workflowTraces        = new ConcurrentLinkedDeque[WorkflowTraceEventDto]()
+  private val recentDecisions       = new ConcurrentLinkedDeque[LoanOriginationDecisionDto]()
 
   knownSegments.add("RETAIL-PRIME")
+  knownRiskCoordinators.add(RiskSignalAgentState.coordinatorKeyFor("BOOTSTRAP"))
 
   def recordTrace(
       stage: String,
@@ -89,13 +92,16 @@ class CustomerClusterGateway(
         ),
         timestamp = signal.emittedAt
       )
-      val targetEntity = sharding.entityRefFor(CustomerAgent.TypeKey, targetCustomerId)
+      val targetEntity   = sharding.entityRefFor(CustomerAgent.TypeKey, targetCustomerId)
+      val coordinatorKey = RiskSignalAgentState.coordinatorKeyFor(signal.signalId)
+      knownRiskCoordinators.add(coordinatorKey)
+
       targetEntity
         .ask[CustomerAgent.IngestionAck](replyTo => CustomerAgent.PropagatePeerRisk(signal, Some(replyTo)))
         .foreach { _ =>
           val ackTime = Instant.now()
           sharding
-            .entityRefFor(RiskSignalAgent.TypeKey, "GLOBAL-RISK-SIGNAL-COORDINATOR")
+            .entityRefFor(RiskSignalAgent.TypeKey, coordinatorKey)
             .tell(RiskSignalAgent.AcknowledgeSignalDelivery(signal.signalId, ackTime, None))
 
           signal.outboxId.foreach { outboxId =>
@@ -106,6 +112,27 @@ class CustomerClusterGateway(
           }
         }
 
+    override def retryPendingOutbox(
+        customerId: String,
+        pendingEntries: Iterable[OutboxEntry]
+    ): Unit =
+      pendingEntries.foreach { entry =>
+        entry.peerSignal match
+          case Some(sig) =>
+            val coordinatorKey = RiskSignalAgentState.coordinatorKeyFor(sig.signalId)
+            knownRiskCoordinators.add(coordinatorKey)
+            sharding
+              .entityRefFor(RiskSignalAgent.TypeKey, coordinatorKey)
+              .tell(RiskSignalAgent.DispatchAndTrackSignal(sig, None))
+            sendRiskSignal(sig.targetCustomerId, sig)
+          case None if entry.targetType == OutboxTargetType.RelationshipAgent =>
+            oracleRepository.markOutboxDelivered(entry.outboxId)
+            sharding
+              .entityRefFor(CustomerAgent.TypeKey, customerId)
+              .tell(CustomerAgent.ConfirmOutboxDelivery(entry.outboxId, None))
+          case _ => ()
+      }
+
     override def onEventProcessedByPlugin(
         customerId: String,
         observedEvent: AgentObservedEvent,
@@ -113,19 +140,21 @@ class CustomerClusterGateway(
     ): Unit =
       val persistenceId = s"CustomerAgent:$customerId"
 
-      // 1. Record in Oracle Exadata SA_PERSISTENCE (Event Journal + SituationEvaluated + Bounded Snapshot + Transactional Outbox)
-      oracleRepository.appendJournalEvent(
+      // 1. Record in Oracle Exadata SA_PERSISTENCE (Batched Event Journal + SituationEvaluated + Bounded Snapshot + Transactional Outbox)
+      oracleRepository.appendJournalEventsBatch(
         persistenceId = persistenceId,
-        eventType = observedEvent.eventType,
-        payloadSummary = s"Plugin=${result.situationEvaluated.handledByPluginId}, eventId=${observedEvent.eventId}",
-        timestamp = observedEvent.occurredAt
-      )
-      oracleRepository.appendJournalEvent(
-        persistenceId = persistenceId,
-        eventType = "SituationEvaluated",
-        payloadSummary =
-          s"v=${result.updatedState.stateVersion}, status=${result.updatedState.situationSummary.financialSituationStatus}, completeness=${result.updatedState.dataCompleteness.score}",
-        timestamp = observedEvent.occurredAt
+        events = List(
+          (
+            observedEvent.eventType,
+            s"Plugin=${result.situationEvaluated.handledByPluginId}, eventId=${observedEvent.eventId}",
+            observedEvent.occurredAt
+          ),
+          (
+            "SituationEvaluated",
+            s"v=${result.updatedState.stateVersion}, status=${result.updatedState.situationSummary.financialSituationStatus}, completeness=${result.updatedState.dataCompleteness.score}",
+            observedEvent.occurredAt
+          )
+        )
       )
       oracleRepository.saveBoundedSnapshot(persistenceId, result.updatedState)
       oracleRepository.persistOutboxEntries(result.outboxEntries)
@@ -149,14 +178,16 @@ class CustomerClusterGateway(
         timestamp = observedEvent.occurredAt
       )
 
-      // 2. Project to PortfolioRiskAgent (Section 6 & 15)
-      val segId = result.updatedState.segmentId
+      // 2. Project to Sharded PortfolioRiskAgent Sub-Segment (Section 6, 15 & Roadmap 9.2)
+      val segId     = result.updatedState.segmentId
+      val subSegKey = PortfolioSituationState.subSegmentKeyFor(segId, customerId)
       knownSegments.add(segId)
+      knownSubSegments.add(subSegKey)
       sharding
-        .entityRefFor(PortfolioRiskAgent.TypeKey, segId)
+        .entityRefFor(PortfolioRiskAgent.TypeKey, subSegKey)
         .tell(PortfolioRiskAgent.UpdateCustomerInPortfolio(result.updatedState, None))
 
-      // 3. Process Transactional Outbox entries (RelationshipAgent & RiskSignalAgent)
+      // 3. Process Transactional Outbox entries (RelationshipAgent & Sharded RiskSignalAgent)
       observedEvent match
         case TransactionObserved(_, _, tx, _) =>
           val relId = List(customerId, tx.counterpartyId).sorted.mkString("<->")
@@ -180,8 +211,10 @@ class CustomerClusterGateway(
           .entityRefFor(RelationshipAgent.TypeKey, relId)
           .tell(RelationshipAgent.RecordPropagatedRisk(sig.attenuatedRiskScore, sig.emittedAt, None))
 
+        val coordinatorKey = RiskSignalAgentState.coordinatorKeyFor(sig.signalId)
+        knownRiskCoordinators.add(coordinatorKey)
         sharding
-          .entityRefFor(RiskSignalAgent.TypeKey, "GLOBAL-RISK-SIGNAL-COORDINATOR")
+          .entityRefFor(RiskSignalAgent.TypeKey, coordinatorKey)
           .tell(RiskSignalAgent.DispatchAndTrackSignal(sig, None))
       }
 
@@ -387,8 +420,10 @@ class CustomerClusterGateway(
         timestamp = pattern.detectedAt
       )
 
+      val subSegKey = PortfolioSituationState.subSegmentKeyFor("RETAIL-PRIME", pattern.affectedCustomerId)
+      knownSubSegments.add(subSegKey)
       sharding
-        .entityRefFor(PortfolioRiskAgent.TypeKey, "RETAIL-PRIME")
+        .entityRefFor(PortfolioRiskAgent.TypeKey, subSegKey)
         .tell(PortfolioRiskAgent.IngestGlobalRiskPattern(pattern, None))
 
       entityFor(pattern.affectedCustomerId)
@@ -407,15 +442,30 @@ class CustomerClusterGateway(
     }
 
   def getRiskSignalAgentState: Future[RiskSignalAgentState] =
-    sharding
-      .entityRefFor(RiskSignalAgent.TypeKey, "GLOBAL-RISK-SIGNAL-COORDINATOR")
-      .ask(replyTo => RiskSignalAgent.GetRiskSignalState(replyTo))
+    val coordKeys = knownRiskCoordinators.asScala.toList
+    Future
+      .traverse(coordKeys) { key =>
+        sharding
+          .entityRefFor(RiskSignalAgent.TypeKey, key)
+          .ask[RiskSignalAgentState](replyTo => RiskSignalAgent.GetRiskSignalState(replyTo))
+      }
+      .map(shards => RiskSignalAgentState.mergeShards("SHARDED-RISK-SIGNAL-COORDINATORS", shards))
 
   def getPortfolioStates: Future[List[PortfolioSituationState]] =
-    val segs = knownSegments.asScala.toList
-    Future.traverse(segs) { segId =>
-      sharding.entityRefFor(PortfolioRiskAgent.TypeKey, segId).ask(replyTo => PortfolioRiskAgent.GetPortfolioSituation(replyTo))
-    }
+    val segs    = knownSegments.asScala.toList
+    val subSegs = knownSubSegments.asScala.toList
+    Future
+      .traverse(subSegs) { subKey =>
+        sharding
+          .entityRefFor(PortfolioRiskAgent.TypeKey, subKey)
+          .ask[PortfolioSituationState](replyTo => PortfolioRiskAgent.GetPortfolioSituation(replyTo))
+      }
+      .map { subStates =>
+        segs.map { segId =>
+          val matching = subStates.filter(_.segmentId.startsWith(s"$segId#"))
+          PortfolioSituationState.mergeSubSegments(segId, matching)
+        }
+      }
 
   def getDocumentVerificationStates: Future[List[DocumentVerificationAgentState]] =
     val cids = knownCustomers.asScala.toList
@@ -450,7 +500,8 @@ class CustomerClusterGateway(
   def resetAll(): Future[Unit] =
     val currentIds = knownCustomers.asScala.toList
     val relIds     = knownRelationships.asScala.toList
-    val segIds     = knownSegments.asScala.toList
+    val subSegIds  = knownSubSegments.asScala.toList
+    val riskKeys   = knownRiskCoordinators.asScala.toList
 
     for
       _ <- Future.traverse(currentIds) { cid =>
@@ -464,15 +515,20 @@ class CustomerClusterGateway(
       _ <- Future.traverse(relIds) { rid =>
         sharding.entityRefFor(RelationshipAgent.TypeKey, rid).ask[CustomerAgent.IngestionAck](replyTo => RelationshipAgent.ResetRelationship(replyTo))
       }
-      _ <- Future.traverse(segIds) { sid =>
+      _ <- Future.traverse(subSegIds) { sid =>
         sharding.entityRefFor(PortfolioRiskAgent.TypeKey, sid).ask[CustomerAgent.IngestionAck](replyTo => PortfolioRiskAgent.ResetPortfolio(replyTo))
       }
-      _ <- sharding
-        .entityRefFor(RiskSignalAgent.TypeKey, "GLOBAL-RISK-SIGNAL-COORDINATOR")
-        .ask[CustomerAgent.IngestionAck](replyTo => RiskSignalAgent.ResetRiskSignals(replyTo))
+      _ <- Future.traverse(riskKeys) { rkey =>
+        sharding
+          .entityRefFor(RiskSignalAgent.TypeKey, rkey)
+          .ask[CustomerAgent.IngestionAck](replyTo => RiskSignalAgent.ResetRiskSignals(replyTo))
+      }
     yield
       knownCustomers.clear()
       knownRelationships.clear()
+      knownSubSegments.clear()
+      knownRiskCoordinators.clear()
+      knownRiskCoordinators.add(RiskSignalAgentState.coordinatorKeyFor("BOOTSTRAP"))
       workflowTraces.clear()
       recentDecisions.clear()
       oracleRepository.reset()

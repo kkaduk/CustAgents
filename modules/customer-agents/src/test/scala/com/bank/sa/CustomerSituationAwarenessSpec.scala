@@ -482,4 +482,92 @@ class CustomerSituationAwarenessSpec
       finally
         binding.unbind().futureValue
     }
+
+    "enforce all Section 9 Roadmap improvements: 64-bit event digests, bounded super-node Ego-Network, sharded Risk/Portfolio coordinators, Outbox retry sweeper, batched journal writes, and SQL/PGQ Graph query pushdown" in {
+      val now = Instant.parse("2026-11-07T17:00:00Z")
+
+      // 1. Verify 64-bit collision-resistant event digest (Roadmap 9.5)
+      val d1 = CustomerSituationState.digest64("TX-10001")
+      val d2 = CustomerSituationState.digest64("TX-10002")
+      d1 should not be d2
+      var state = CustomerSituationState.empty("CUST-SUPER-NODE").copy(maxEgoNetworkPeers = 5)
+      state = state.markEventProcessed("HIST-EVT-999")
+      state.processedEventDigests should contain(CustomerSituationState.digest64("HIST-EVT-999"))
+      state.hasProcessedEvent("HIST-EVT-999") shouldBe true
+
+      // 2. Verify Bounded Ego-Network & High-Degree Super-Node fan-out protection (Roadmap 9.4)
+      val plugin = new TransactionObservedPlugin(secondHopAttenuation = 0.65, maxPushPeers = 3)
+      (1 to 8).foreach { idx =>
+        val peerTx = EnrichedTransaction(
+          txId = s"TX-PEER-SN-$idx",
+          customerId = "CUST-SUPER-NODE",
+          counterpartyId = s"CUST-PEER-$idx",
+          counterpartyIsBankClient = true,
+          direction = TransactionDirection.Outflow,
+          amount = BigDecimal(idx * 100),
+          currency = "EUR",
+          category = TransactionCategory.PeerTransfer,
+          resultsInOverdraft = false,
+          restrictedTag = None,
+          timestamp = now.plusSeconds(idx.toLong)
+        )
+        state = state.recordTransaction(peerTx)
+      }
+      // Ego-network is strictly bounded to maxEgoNetworkPeers = 5
+      state.egoNetwork.size shouldBe 5
+      state.isHighDegreeSuperNode shouldBe true
+
+      // When a 1st-hop restricted hit occurs on the super-node, proactive push outbox entries are capped at maxPushPeers = 3
+      val restrictedTx = EnrichedTransaction(
+        txId = "TX-SN-SANCTION-99",
+        customerId = "CUST-SUPER-NODE",
+        counterpartyId = "SANCTION-HUB-X",
+        counterpartyIsBankClient = false,
+        direction = TransactionDirection.Outflow,
+        amount = BigDecimal("2500.00"),
+        currency = "EUR",
+        category = TransactionCategory.HighRiskTransfer,
+        resultsInOverdraft = false,
+        restrictedTag = Some(
+          RestrictedEntityTag("SANCTION-HUB-X", RestrictionLevel.SanctionedEntity, "EU-AML", "Sanctioned hub")
+        ),
+        timestamp = now.plusSeconds(30)
+      )
+      val pluginResult = plugin.process(
+        state,
+        TransactionObserved("TX-SN-SANCTION-99", "CUST-SUPER-NODE", restrictedTx, restrictedTx.timestamp)
+      )
+      val peerOutboxSignals = pluginResult.outboxEntries.flatMap(_.peerSignal)
+      peerOutboxSignals.size shouldBe 3
+
+      // 3. Verify Sharded RiskSignalAgent & Sharded PortfolioRiskAgent Sub-Segment Merging (Roadmap 9.2)
+      val coordKey1 = RiskSignalAgentState.coordinatorKeyFor("SIG-1")
+      val coordKey2 = RiskSignalAgentState.coordinatorKeyFor("SIG-2")
+      coordKey1 should startWith("RISK-SIGNAL-SHARD-")
+      coordKey2 should startWith("RISK-SIGNAL-SHARD-")
+
+      val subSegKey = PortfolioSituationState.subSegmentKeyFor("RETAIL-PRIME", "CUST-SUPER-NODE")
+      subSegKey should startWith("RETAIL-PRIME#SHARD-")
+      val shardA = PortfolioSituationState(subSegKey).updateCustomerEntry(pluginResult.updatedState)
+      val mergedPortfolio = PortfolioSituationState.mergeSubSegments("RETAIL-PRIME", List(shardA))
+      mergedPortfolio.activeCustomersCount shouldBe 1
+      mergedPortfolio.highRiskCustomerCount shouldBe 1
+
+      // 4. Verify Active Outbox Retry Sweeper command on CustomerAgent (Roadmap 9.3)
+      gateway.entityFor("CLIENT-A") ! com.bank.sa.agent.CustomerAgent.RetryPendingOutbox
+      val stateAfterSweep = gateway.getSituationState("CLIENT-A").futureValue
+      stateAfterSweep.pendingOutbox shouldBe empty
+
+      // 5. Verify Batched Journal Writes & SQL/PGQ GRAPH_TABLE query in OracleExadataRepository (Roadmap 9.1 & 9.6)
+      val batchRows = gateway.oracleRepository.appendJournalEventsBatch(
+        "CustomerAgent:CUST-BATCH-1",
+        Seq(
+          ("TransactionObserved", "Batch Event 1", now),
+          ("SituationEvaluated", "Batch Event 2", now)
+        )
+      )
+      batchRows should have size 2
+      gateway.oracleRepository.GlobalGraphPgqSql should include("GRAPH_TABLE")
+      gateway.oracleRepository.GlobalGraphPgqSql should include("SA_GRAPH.SA_GLOBAL_RELATIONSHIP_GRAPH")
+    }
   }

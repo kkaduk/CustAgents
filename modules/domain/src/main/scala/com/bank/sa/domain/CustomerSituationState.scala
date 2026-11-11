@@ -148,25 +148,27 @@ final case class CustomerSituationState(
     situationSummary: CustomerSituationSummary = CustomerSituationSummary(),
     dataCompleteness: DataCompleteness = DataCompleteness(),
     pendingOutbox: Map[String, OutboxEntry] = Map.empty,
-    processedEventDigests: Set[Int] = Set.empty,
-    recentEventIds: List[String] = Nil
+    processedEventDigests: Set[Long] = Set.empty,
+    recentEventIds: List[String] = Nil,
+    maxEgoNetworkPeers: Int = CustomerSituationState.MaxEgoNetworkPeers
 ) extends Serializable:
 
   /**
-   * Idempotency check (Section 10):
-   * Checks both the recent event/tx ID list AND the compact historical digest set so duplicate
-   * historical events beyond the short recent list cannot mutate customer state twice.
+   * Idempotency check (Section 10 & Roadmap 9.5):
+   * Checks both the recent event/tx ID list AND the 64-bit collision-resistant historical digest set (`Set[Long]`)
+   * so duplicate historical events beyond the short recent list cannot mutate customer state twice.
    */
   def hasProcessedTx(txId: String): Boolean =
-    recentTxIds.contains(txId) || processedEventDigests.contains(txId.hashCode)
+    recentTxIds.contains(txId) || processedEventDigests.contains(CustomerSituationState.digest64(txId))
 
   def hasProcessedEvent(eventId: String): Boolean =
-    recentEventIds.contains(eventId) || recentTxIds.contains(eventId) || processedEventDigests.contains(eventId.hashCode)
+    recentEventIds.contains(eventId) || recentTxIds.contains(eventId) || processedEventDigests.contains(CustomerSituationState.digest64(eventId))
 
   def markEventProcessed(eventId: String): CustomerSituationState =
+    val digest = CustomerSituationState.digest64(eventId)
     val updatedDigests =
-      if processedEventDigests.size >= 10000 then processedEventDigests.drop(1000) + eventId.hashCode
-      else processedEventDigests + eventId.hashCode
+      if processedEventDigests.size >= 10000 then processedEventDigests.drop(1000) + digest
+      else processedEventDigests + digest
     copy(
       recentEventIds = (eventId :: recentEventIds).distinct.take(250),
       processedEventDigests = updatedDigests
@@ -179,14 +181,28 @@ final case class CustomerSituationState(
   def acknowledgeOutbox(outboxId: String): CustomerSituationState =
     copy(pendingOutbox = pendingOutbox - outboxId)
 
+  /** True when the customer's localized Ego-Network reaches the super-node degree threshold (Roadmap 9.4). */
+  def isHighDegreeSuperNode: Boolean =
+    egoNetwork.size >= maxEgoNetworkPeers
+
   def recordTransaction(tx: EnrichedTransaction): CustomerSituationState =
     if hasProcessedTx(tx.txId) then this
     else
       val updatedCashflow = cashflow.record(tx)
-      val updatedNetwork = egoNetwork.updatedWith(tx.counterpartyId) {
+      val rawUpdatedNetwork = egoNetwork.updatedWith(tx.counterpartyId) {
         case Some(existing) => Some(existing.record(tx))
         case None           => Some(CounterpartyConnection.initial(tx))
       }
+      // Roadmap 9.4: Bound Ego-Network to top `maxEgoNetworkPeers` active peers by bank-client priority, recency, and volume
+      val updatedNetwork =
+        if rawUpdatedNetwork.size <= maxEgoNetworkPeers then rawUpdatedNetwork
+        else
+          rawUpdatedNetwork.valuesIterator.toList
+            .sortBy(c => (!c.isBankClient, -c.lastInteractionAt.toEpochMilli, -c.totalVolume))
+            .take(maxEgoNetworkPeers)
+            .map(c => c.counterpartyId -> c)
+            .toMap
+
       val updatedRisks = tx.restrictedTag match
         case Some(tag) =>
           val trace = RiskExposureTrace.fromDirectRestrictedTx(tx, tag)
@@ -200,9 +216,10 @@ final case class CustomerSituationState(
           Some(tx.timestamp)
         else situationSummary.lastSalaryObserved
 
+      val txDigest = CustomerSituationState.digest64(tx.txId)
       val updatedDigests =
-        if processedEventDigests.size >= 10000 then processedEventDigests.drop(1000) + tx.txId.hashCode
-        else processedEventDigests + tx.txId.hashCode
+        if processedEventDigests.size >= 10000 then processedEventDigests.drop(1000) + txDigest
+        else processedEventDigests + txDigest
 
       val baseUpdated = copy(
         cashflow = updatedCashflow,
@@ -318,14 +335,41 @@ final case class CustomerSituationState(
       )
     )
 
-  /** Connected bank clients in the customer's Ego-Network eligible for risk propagation. */
+  /** Connected bank clients in the customer's Ego-Network eligible for risk propagation, sorted by recency & volume. */
   def connectedBankPeers: List[CounterpartyConnection] =
-    egoNetwork.valuesIterator.filter(_.isBankClient).toList
+    egoNetwork.valuesIterator
+      .filter(_.isBankClient)
+      .toList
+      .sortBy(c => (-c.lastInteractionAt.toEpochMilli, -c.totalVolume))
 
   /** Highest risk exposure score across 1st-hop, 2nd-hop, and Global Graph connections. */
   def maxNetworkRiskScore: Double =
     riskExposures.valuesIterator.map(_.riskScore).maxOption.getOrElse(0.0)
 
 object CustomerSituationState:
+  /** Maximum 1st-hop counterparties retained in a single actor's localized Ego-Network (Roadmap 9.4). */
+  val MaxEgoNetworkPeers: Int = 200
+
+  /** Maximum peer push fan-out threshold before delegating to Global Graph / Super-Node suppression (Roadmap 9.4). */
+  val MaxPushPeersThreshold: Int = 200
+
+  /**
+   * 64-bit FNV-1a + MurmurHash3 fmix64 avalanche digest (Roadmap 9.5).
+   * Reduces birthday-paradox collision probability at 10,000 events from ~1.1% (32-bit Int) to < 3e-12 (64-bit Long).
+   */
+  def digest64(value: String): Long =
+    var h = 0xcbf29ce484222325L
+    var i = 0
+    while i < value.length do
+      h ^= (value.charAt(i).toLong & 0xffffL)
+      h *= 0x100000001b3L
+      i += 1
+    h ^= (h >>> 33)
+    h *= 0xff51afd7ed558ccdL
+    h ^= (h >>> 33)
+    h *= 0xc4ceb9fe1a85ec53L
+    h ^= (h >>> 33)
+    h
+
   def empty(customerId: String): CustomerSituationState =
     CustomerSituationState(customerId = customerId)
