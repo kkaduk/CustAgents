@@ -369,6 +369,8 @@ Silnik transakcyjny zwraca dyrektywę dla systemu płatniczego. Sam nie wykonuje
 
 Checkpointing nie oznacza automatycznie gwarancji exactly-once całego procesu. Kod nie konfiguruje transakcyjnego trybu sinka Kafka ani atomowego połączenia z zapisem agentów.
 
+![Flink i wsbogacenie](images/Flink_Kafka.png)
+
 **12. Aktory, gateway i protokoły**
 
 Źródła: [CustomerAgent.scala](/Users/krzysztof/Projects/OCS/CustAgents/modules/customer-agents/src/main/scala/com/bank/sa/agent/CustomerAgent.scala), [DomainAgents.scala](/Users/krzysztof/Projects/OCS/CustAgents/modules/customer-agents/src/main/scala/com/bank/sa/agent/DomainAgents.scala), [CustomerClusterGateway.scala](/Users/krzysztof/Projects/OCS/CustAgents/modules/customer-agents/src/main/scala/com/bank/sa/agent/CustomerClusterGateway.scala).
@@ -425,6 +427,9 @@ Pozostali agenci mają własne kontrakty `Command` i `Event` oraz `Passivate`:
 
 `DocumentVerificationAgent` nie implementuje sprawdzania autentyczności dokumentu, OCR ani integracji z wystawcą. Przyjmuje już przygotowany `VerifiedDocumentFact`, a następnie klasyfikuje go i zapisuje.
 
+![Aktorzy i gateway](images/Aktorzy.png)
+
+
 **13. Repozytorium Oracle**
 
 Źródło: [OracleExadataRepository.scala](/Users/krzysztof/Projects/OCS/CustAgents/modules/customer-agents/src/main/scala/com/bank/sa/oracle/OracleExadataRepository.scala).
@@ -451,6 +456,9 @@ Repozytorium odpowiada za:
 - audyt wszystkich typów decyzji.
 
 Analiza grafowa łączy zapytanie SQL `GRAPH_TABLE` z detektorami wykonywanymi na kolekcjach JVM. Nie cała analiza jest delegowana do Oracle.
+
+![Oracle](images/OracleRepo.png)
+
 
 **14. API i modele transportowe**
 
@@ -484,6 +492,9 @@ Analiza grafowa łączy zapytanie SQL `GRAPH_TABLE` z detektorami wykonywanymi n
 | `LoanOriginationServer` | Trasy HTTP, UI, operacje demonstracyjne, podgląd grafu i decyzje. Obiekt towarzyszący dostarcza dane pomocnicze demonstracji. |
 
 **Interfejs nazwany gRPC nie jest obecnie standardowym transportem gRPC.** Serwer obsługuje JSON przez Pekko HTTP pod ścieżkami przypominającymi nazwy metod RPC. Obecność pliku `.proto` i Scala trait nie zapewnia zgodności z klientem protobuf/gRPC.
+
+![API](images/Api.png)
+
 
 **15. Punkty wejścia i testy**
 
