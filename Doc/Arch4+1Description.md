@@ -229,6 +229,8 @@ Scenariusze rozdzielają **projekcję przyszłości**, **formalną decyzję kred
 | `OutboxEntry` | Intencja efektu ubocznego; pełny payload sygnału jest dostępny przez `peerSignal`. |
 | `LoanApplication` | Wniosek kredytowy i obliczenie raty annuitetowej. |
 
+![Nodele podstaowe](images/Modele_podstawowe.png)
+
 **7. Stan klienta i okna przepływów**
 
 Źródła: [CustomerSituationState.scala](/Users/krzysztof/Projects/OCS/CustAgents/modules/domain/src/main/scala/com/bank/sa/domain/CustomerSituationState.scala), [SlidingWindowCashflow.scala](/Users/krzysztof/Projects/OCS/CustAgents/modules/domain/src/main/scala/com/bank/sa/domain/SlidingWindowCashflow.scala).
@@ -254,6 +256,8 @@ Nazwa i komentarze sugerują ring buffer oraz O(1), ale implementacja `SlidingWi
 
 Kompletność to heurystyka: dochód daje 0,50, historia transakcji 0,30, a KYC 0,20. Poziom `Complete` zaczyna się od 0,80, więc może wystąpić bez KYC.
 
+![Stan klienta](images/StanKlienta.png)
+
 **8. Pluginy zdarzeń**
 
 Źródło: [EventPluginArchitecture.scala](/Users/krzysztof/Projects/OCS/CustAgents/modules/domain/src/main/scala/com/bank/sa/domain/EventPluginArchitecture.scala).
@@ -275,6 +279,9 @@ Kompletność to heurystyka: dochód daje 0,50, historia transakcji 0,30, a KYC 
 | Obiekt `EventPluginRegistry` | Buduje listę ośmiu domyślnych pluginów i wspólny rejestr. |
 
 To dobry punkt rozszerzeń logiki interpretacyjnej. Rejestr przyjmuje listę pluginów programowo; projekt nie implementuje dynamicznego ładowania pluginów z zewnętrznych bibliotek.
+
+![Plugin Zdarzeń](images/Plugin-zdarzen.png)
+
 
 **9. Modele hierarchii i grafu**
 
@@ -298,6 +305,8 @@ To dobry punkt rozszerzeń logiki interpretacyjnej. Rejestr przyjmuje listę plu
 | `GlobalBankingSituation` | Zbiorczy odczyt stanów agentów, grafu i schematów; nie jest osobnym aktorem globalnym. |
 
 Ograniczanie portfela zachowuje klientów o najwyższym ryzyku i najnowszej aktualizacji. Z tego powodu metryki portfela dotyczą **wybranego podzbioru**, a nie pełnej populacji segmentu.
+
+![Nodele hierarchi](images/ModelHierarchi.png)
 
 **10. Modele decyzji i silniki**
 
@@ -333,6 +342,9 @@ W projekcji:
 `expectedMonthlyLiquidity = dochód − wydatki z 30 dni − nowa rata`
 
 Silnik transakcyjny zwraca dyrektywę dla systemu płatniczego. Sam nie wykonuje przelewu ani nie integruje się z mechanizmem księgowania.
+
+![Nodele decyzji](images/Decyzje-silniki.png)
+
 
 **11. Wzbogacanie Flink i Kafka**
 
