@@ -124,6 +124,48 @@ object RiskExposureTrace:
       detectedAt = pattern.detectedAt
     )
 
+  /**
+   * Section 2 & 6.3 of Doc/NowePotrzeby.md:
+   * Employee -> Phone Number -> Customer serviced by that employee (`EMPLOYEE_CUSTOMER_PHONE_MATCH`).
+   * Note: Treated as a risk signal requiring explanation rather than automatic proof of fraud.
+   */
+  def fromEmployeePhoneMatch(change: NormalizedCustomerContactChange): RiskExposureTrace =
+    val empId = change.matchedEmployeeId.getOrElse("EMP-UNKNOWN")
+    val score = if change.employeeServicesCustomer then 0.65 else 0.45
+    RiskExposureTrace(
+      exposureKey = s"EMPLOYEE_PHONE:$empId:${change.newPhoneNormalized}",
+      sourceEntityId = empId,
+      intermediaryPeerId = Some(change.newPhoneNormalized),
+      hopDistance = 2,
+      riskScore = score,
+      reasonCode = "EMPLOYEE_CUSTOMER_PHONE_MATCH",
+      description =
+        s"Employee '$empId' (${change.matchedEmployeeName.getOrElse("Bank Staff")}) shares phone number '${change.newPhoneNormalized}' with customer '${change.customerId}' (servicesCustomer=${change.employeeServicesCustomer}, prevPhone=${change.previousPhoneNormalized.getOrElse("NONE")}, source=${change.sourceSystem})",
+      evidenceIds = List(change.eventId, empId, s"PHONE:${change.newPhoneNormalized}"),
+      detectedAt = change.occurredAt
+    )
+
+  /**
+   * Section 4 & 6.3 of Doc/NowePotrzeby.md:
+   * Account history verification signal (`UNKNOWN_ACCOUNT_HISTORY` or high-risk account history).
+   */
+  def fromAccountHistoryRisk(event: AccountHistoryRiskDetected): RiskExposureTrace =
+    val v     = event.verification
+    val code  = v.riskSignalCode.getOrElse("UNKNOWN_ACCOUNT_HISTORY")
+    val score = if v.highRiskConnections.nonEmpty then 0.72 else 0.35
+    RiskExposureTrace(
+      exposureKey = s"ACCOUNT_HISTORY:${event.targetAccountId}",
+      sourceEntityId = event.targetAccountId,
+      intermediaryPeerId = v.ownerCustomerId,
+      hopDistance = 1,
+      riskScore = score,
+      reasonCode = code,
+      description =
+        s"Account verification (${event.transferAmount} PLN) for '${event.targetAccountId}': ${v.assessment} (knownInBank=${v.knownInBank}, txCount=${v.transactionCount})",
+      evidenceIds = (event.eventId :: v.suspiciousTxIds).distinct,
+      detectedAt = event.occurredAt
+    )
+
 /**
  * Complete Level-2 Situation Awareness state maintained in memory by a `CustomerAgent` and persisted in bounded Oracle snapshots (Section 3):
  * - Current financial indicators (`situationSummary`)
@@ -133,6 +175,7 @@ object RiskExposureTrace:
  * - Evidence IDs (`recentTxIds`, `recentEventIds`) and compact historical digest (`processedEventDigests` for Section 10 Idempotency)
  * - Transactional Outbox (`pendingOutbox` for Section 10 Reliable Delivery)
  * - State version, rule version, and data completeness (`stateVersion`, `ruleVersion`, `dataCompleteness` for Section 10 Situation Consistency)
+ * - Owned accounts (`ownedAccountIds`), phone contact history (`currentPhoneNumber`, `contactChangeHistory`) and servicing employees (`servicedByEmployeeIds`) (Doc/NowePotrzeby.md Sections 2, 3.3, 4)
  */
 final case class CustomerSituationState(
     customerId: String,
@@ -150,7 +193,11 @@ final case class CustomerSituationState(
     pendingOutbox: Map[String, OutboxEntry] = Map.empty,
     processedEventDigests: Set[Long] = Set.empty,
     recentEventIds: List[String] = Nil,
-    maxEgoNetworkPeers: Int = CustomerSituationState.MaxEgoNetworkPeers
+    maxEgoNetworkPeers: Int = CustomerSituationState.MaxEgoNetworkPeers,
+    ownedAccountIds: Set[String] = Set.empty,
+    currentPhoneNumber: Option[String] = None,
+    contactChangeHistory: List[NormalizedCustomerContactChange] = Nil,
+    servicedByEmployeeIds: Set[String] = Set.empty
 ) extends Serializable:
 
   /**
@@ -185,14 +232,23 @@ final case class CustomerSituationState(
   def isHighDegreeSuperNode: Boolean =
     egoNetwork.size >= maxEgoNetworkPeers
 
+  def registerOwnedAccount(accountId: String): CustomerSituationState =
+    if accountId.isEmpty || ownedAccountIds.contains(accountId) then this
+    else copy(ownedAccountIds = ownedAccountIds + accountId)
+
   def recordTransaction(tx: EnrichedTransaction): CustomerSituationState =
     if hasProcessedTx(tx.txId) then this
     else
       val updatedCashflow = cashflow.record(tx)
-      val rawUpdatedNetwork = egoNetwork.updatedWith(tx.counterpartyId) {
-        case Some(existing) => Some(existing.record(tx))
-        case None           => Some(CounterpartyConnection.initial(tx))
-      }
+      val isInternalOwn   = tx.isOwnAccountTransfer || tx.category == TransactionCategory.InternalOwnAccountTransfer || tx.counterpartyId == customerId
+
+      val rawUpdatedNetwork =
+        if isInternalOwn then egoNetwork
+        else
+          egoNetwork.updatedWith(tx.counterpartyId) {
+            case Some(existing) => Some(existing.record(tx))
+            case None           => Some(CounterpartyConnection.initial(tx))
+          }
       // Roadmap 9.4: Bound Ego-Network to top `maxEgoNetworkPeers` active peers by bank-client priority, recency, and volume
       val updatedNetwork =
         if rawUpdatedNetwork.size <= maxEgoNetworkPeers then rawUpdatedNetwork
@@ -221,6 +277,14 @@ final case class CustomerSituationState(
         if processedEventDigests.size >= 10000 then processedEventDigests.drop(1000) + txDigest
         else processedEventDigests + txDigest
 
+      val updatedAccounts =
+        (tx.direction match
+          case TransactionDirection.Outflow =>
+            ownedAccountIds ++ tx.fromAccountId.toSet ++ (if isInternalOwn then tx.toAccountId.toSet else Set.empty)
+          case TransactionDirection.Inflow =>
+            ownedAccountIds ++ tx.toAccountId.toSet ++ (if isInternalOwn then tx.fromAccountId.toSet else Set.empty)
+        ).filter(_.nonEmpty)
+
       val baseUpdated = copy(
         cashflow = updatedCashflow,
         egoNetwork = updatedNetwork,
@@ -229,7 +293,49 @@ final case class CustomerSituationState(
         processedEventDigests = updatedDigests,
         lastUpdatedAt = latestTime,
         stateVersion = stateVersion + 1L,
-        situationSummary = situationSummary.copy(lastSalaryObserved = lastSalary)
+        situationSummary = situationSummary.copy(lastSalaryObserved = lastSalary),
+        ownedAccountIds = updatedAccounts
+      )
+      baseUpdated.recomputeSituationAwareness(latestTime)
+
+  def recordContactChange(change: NormalizedCustomerContactChange): CustomerSituationState =
+    if hasProcessedEvent(change.eventId) then this
+    else
+      val latestTime = if change.occurredAt.isAfter(lastUpdatedAt) then change.occurredAt else lastUpdatedAt
+      val updatedRisks =
+        if change.matchedEmployeeId.isDefined then
+          val trace = RiskExposureTrace.fromEmployeePhoneMatch(change)
+          riskExposures.updated(trace.exposureKey, trace)
+        else riskExposures
+
+      val updatedEmployees =
+        if change.employeeServicesCustomer then servicedByEmployeeIds ++ change.matchedEmployeeId.toSet
+        else servicedByEmployeeIds ++ change.changedByEmployeeId.toSet
+
+      val baseUpdated = markEventProcessed(change.eventId).copy(
+        currentPhoneNumber = Some(change.newPhoneNormalized),
+        contactChangeHistory = (change :: contactChangeHistory).distinctBy(_.eventId).take(25),
+        servicedByEmployeeIds = updatedEmployees,
+        riskExposures = updatedRisks,
+        lastUpdatedAt = latestTime,
+        stateVersion = stateVersion + 1L
+      )
+      baseUpdated.recomputeSituationAwareness(latestTime)
+
+  def recordAccountHistoryRisk(event: AccountHistoryRiskDetected): CustomerSituationState =
+    if hasProcessedEvent(event.eventId) then this
+    else
+      val latestTime = if event.occurredAt.isAfter(lastUpdatedAt) then event.occurredAt else lastUpdatedAt
+      val updatedRisks =
+        if event.verification.riskSignalCode.isDefined || !event.verification.knownInBank || event.verification.highRiskConnections.nonEmpty then
+          val trace = RiskExposureTrace.fromAccountHistoryRisk(event)
+          riskExposures.updated(trace.exposureKey, trace)
+        else riskExposures
+
+      val baseUpdated = markEventProcessed(event.eventId).copy(
+        riskExposures = updatedRisks,
+        lastUpdatedAt = latestTime,
+        stateVersion = stateVersion + 1L
       )
       baseUpdated.recomputeSituationAwareness(latestTime)
 

@@ -12,7 +12,9 @@ final case class WindowMetrics(
     inflowTxIds: List[String],
     outflowTxIds: List[String],
     highRiskTxIds: List[String],
-    overdraftTxIds: List[String]
+    overdraftTxIds: List[String],
+    internalOwnTransferVolume: BigDecimal = BigDecimal(0),
+    internalOwnTransferTxIds: List[String] = Nil
 ) extends Serializable:
   def netCashflow: BigDecimal = totalInflow - totalOutflow
 
@@ -32,37 +34,52 @@ final case class HourlyCashflowBucket(
     inflowTxIds: List[String] = Nil,
     outflowTxIds: List[String] = Nil,
     highRiskTxIds: List[String] = Nil,
-    overdraftTxIds: List[String] = Nil
+    overdraftTxIds: List[String] = Nil,
+    internalOwnTransferVolume: BigDecimal = BigDecimal(0),
+    internalOwnTransferTxIds: List[String] = Nil
 ) extends Serializable:
 
   def record(tx: EnrichedTransaction): HourlyCashflowBucket =
-    val (newIn, newOut, newInIds, newOutIds) = tx.direction match
-      case TransactionDirection.Inflow =>
-        (inflow + tx.amount, outflow, (tx.txId :: inflowTxIds).take(25), outflowTxIds)
-      case TransactionDirection.Outflow =>
-        (inflow, outflow + tx.amount, inflowTxIds, (tx.txId :: outflowTxIds).take(25))
+    // Section 3.3 of Doc/NowePotrzeby.md: internal transfers between a customer's own accounts
+    // must not artificially inflate real external inflows or outflows.
+    val isInternalOwn = tx.isOwnAccountTransfer || tx.category == TransactionCategory.InternalOwnAccountTransfer
 
-    val isHighRisk = tx.direction == TransactionDirection.Outflow &&
-      (tx.category.isHighRiskCategory || tx.restrictedTag.isDefined)
+    if isInternalOwn then
+      val updatedOwnVol =
+        if tx.direction == TransactionDirection.Outflow then internalOwnTransferVolume + tx.amount
+        else internalOwnTransferVolume
+      copy(
+        internalOwnTransferVolume = updatedOwnVol,
+        internalOwnTransferTxIds = (tx.txId :: internalOwnTransferTxIds).distinct.take(25)
+      )
+    else
+      val (newIn, newOut, newInIds, newOutIds) = tx.direction match
+        case TransactionDirection.Inflow =>
+          (inflow + tx.amount, outflow, (tx.txId :: inflowTxIds).take(25), outflowTxIds)
+        case TransactionDirection.Outflow =>
+          (inflow, outflow + tx.amount, inflowTxIds, (tx.txId :: outflowTxIds).take(25))
 
-    val (newHrSpend, newHrIds) =
-      if isHighRisk then (highRiskSpend + tx.amount, (tx.txId :: highRiskTxIds).take(25))
-      else (highRiskSpend, highRiskTxIds)
+      val isHighRisk = tx.direction == TransactionDirection.Outflow &&
+        (tx.category.isHighRiskCategory || tx.restrictedTag.isDefined)
 
-    val (newOdCount, newOdIds) =
-      if tx.resultsInOverdraft then (overdraftCount + 1, (tx.txId :: overdraftTxIds).take(25))
-      else (overdraftCount, overdraftTxIds)
+      val (newHrSpend, newHrIds) =
+        if isHighRisk then (highRiskSpend + tx.amount, (tx.txId :: highRiskTxIds).take(25))
+        else (highRiskSpend, highRiskTxIds)
 
-    copy(
-      inflow = newIn,
-      outflow = newOut,
-      highRiskSpend = newHrSpend,
-      overdraftCount = newOdCount,
-      inflowTxIds = newInIds,
-      outflowTxIds = newOutIds,
-      highRiskTxIds = newHrIds,
-      overdraftTxIds = newOdIds
-    )
+      val (newOdCount, newOdIds) =
+        if tx.resultsInOverdraft then (overdraftCount + 1, (tx.txId :: overdraftTxIds).take(25))
+        else (overdraftCount, overdraftTxIds)
+
+      copy(
+        inflow = newIn,
+        outflow = newOut,
+        highRiskSpend = newHrSpend,
+        overdraftCount = newOdCount,
+        inflowTxIds = newInIds,
+        outflowTxIds = newOutIds,
+        highRiskTxIds = newHrIds,
+        overdraftTxIds = newOdIds
+      )
 
 /**
  * Incremental time-bucketed ring buffer maintained in memory inside each `CustomerAgent`.
@@ -99,7 +116,9 @@ final case class SlidingWindowCashflow(
         inflowTxIds = Nil,
         outflowTxIds = Nil,
         highRiskTxIds = Nil,
-        overdraftTxIds = Nil
+        overdraftTxIds = Nil,
+        internalOwnTransferVolume = BigDecimal(0),
+        internalOwnTransferTxIds = Nil
       )
     ) { (acc, b) =>
       acc.copy(
@@ -110,7 +129,9 @@ final case class SlidingWindowCashflow(
         inflowTxIds = (acc.inflowTxIds ++ b.inflowTxIds).distinct.take(30),
         outflowTxIds = (acc.outflowTxIds ++ b.outflowTxIds).distinct.take(30),
         highRiskTxIds = (acc.highRiskTxIds ++ b.highRiskTxIds).distinct.take(30),
-        overdraftTxIds = (acc.overdraftTxIds ++ b.overdraftTxIds).distinct.take(30)
+        overdraftTxIds = (acc.overdraftTxIds ++ b.overdraftTxIds).distinct.take(30),
+        internalOwnTransferVolume = acc.internalOwnTransferVolume + b.internalOwnTransferVolume,
+        internalOwnTransferTxIds = (acc.internalOwnTransferTxIds ++ b.internalOwnTransferTxIds).distinct.take(30)
       )
     }
 

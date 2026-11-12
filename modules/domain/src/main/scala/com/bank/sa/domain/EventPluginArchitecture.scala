@@ -83,41 +83,77 @@ class TransactionObservedPlugin(
       updatedState: CustomerSituationState,
       now: Instant
   ): List[OutboxEntry] =
-    val relId = List(customerId, tx.counterpartyId).sorted.mkString("<->")
-    val relOutbox = OutboxEntry(
-      outboxId = s"OUTBOX-REL-${tx.txId}-$customerId",
-      sourceCustomerId = customerId,
-      targetType = OutboxTargetType.RelationshipAgent,
-      targetEntityId = relId,
-      messageType = "RelationshipInteractionRecorded",
-      payloadSummary = s"Tx ${tx.txId} (${tx.direction} ${tx.amount} ${tx.currency}) between $customerId and ${tx.counterpartyId}",
-      peerSignal = None,
-      createdAt = now
-    )
+    if tx.isOwnAccountTransfer || tx.counterpartyId == customerId then Nil
+    else
+      val relId = List(customerId, tx.counterpartyId).sorted.mkString("<->")
+      val relOutbox = OutboxEntry(
+        outboxId = s"OUTBOX-REL-${tx.txId}-$customerId",
+        sourceCustomerId = customerId,
+        targetType = OutboxTargetType.RelationshipAgent,
+        targetEntityId = relId,
+        messageType = "RelationshipInteractionRecorded",
+        payloadSummary = s"Tx ${tx.txId} (${tx.direction} ${tx.amount} ${tx.currency}) between $customerId and ${tx.counterpartyId}",
+        peerSignal = None,
+        createdAt = now
+      )
 
-    val riskOutboxEntries: List[OutboxEntry] = tx.restrictedTag match
-      case Some(tag) =>
-        val attenuatedScore =
-          BigDecimal(tag.level.baseRiskWeight * secondHopAttenuation)
-            .setScale(4, BigDecimal.RoundingMode.HALF_UP)
-            .toDouble
+      val riskOutboxEntries: List[OutboxEntry] = tx.restrictedTag match
+        case Some(tag) =>
+          val attenuatedScore =
+            BigDecimal(tag.level.baseRiskWeight * secondHopAttenuation)
+              .setScale(4, BigDecimal.RoundingMode.HALF_UP)
+              .toDouble
 
-        updatedState.connectedBankPeers
-          .filterNot(_.counterpartyId == customerId)
-          .take(maxPushPeers)
-          .map { peerConn =>
-            val outboxId = s"OUTBOX-SIG-${tx.txId}-TO-${peerConn.counterpartyId}"
+          updatedState.connectedBankPeers
+            .filterNot(_.counterpartyId == customerId)
+            .take(maxPushPeers)
+            .map { peerConn =>
+              val outboxId = s"OUTBOX-SIG-${tx.txId}-TO-${peerConn.counterpartyId}"
+              val signal = PeerRiskSignal(
+                signalId = s"SIG-${tx.txId}-TO-${peerConn.counterpartyId}",
+                originCustomerId = tag.entityId,
+                fromCustomerId = customerId,
+                targetCustomerId = peerConn.counterpartyId,
+                hopCount = 2,
+                attenuatedRiskScore = attenuatedScore,
+                reasonCode = s"RC_302_PEER_LINK_${tag.level.toString.toUpperCase}",
+                reasonDescription =
+                  s"Peer '$customerId' transacted (${tx.txId}) with restricted entity '${tag.entityId}' [${tag.listSource}: ${tag.reasonDescription}]",
+                rootEvidenceIds = (tx.txId :: peerConn.recentTxIds).distinct,
+                emittedAt = tx.timestamp,
+                outboxId = Some(outboxId)
+              )
+              OutboxEntry(
+                outboxId = outboxId,
+                sourceCustomerId = customerId,
+                targetType = OutboxTargetType.RiskSignalAgent,
+                targetEntityId = peerConn.counterpartyId,
+                messageType = "PropagatePeerRisk",
+                payloadSummary = s"2nd-hop risk signal ${signal.signalId} to ${peerConn.counterpartyId} (score=$attenuatedScore)",
+                peerSignal = Some(signal),
+                createdAt = now
+              )
+            }
+
+        case None if tx.counterpartyIsBankClient && tx.counterpartyId != customerId =>
+          val directExposures = updatedState.riskExposures.valuesIterator.filter(_.hopDistance == 1).toList
+          directExposures.map { exposure =>
+            val attenuatedScore =
+              BigDecimal(exposure.riskScore * secondHopAttenuation)
+                .setScale(4, BigDecimal.RoundingMode.HALF_UP)
+                .toDouble
+            val outboxId = s"OUTBOX-SIG-${tx.txId}-FROM-$customerId-TO-${tx.counterpartyId}"
             val signal = PeerRiskSignal(
-              signalId = s"SIG-${tx.txId}-TO-${peerConn.counterpartyId}",
-              originCustomerId = tag.entityId,
+              signalId = s"SIG-${tx.txId}-FROM-$customerId-TO-${tx.counterpartyId}",
+              originCustomerId = exposure.sourceEntityId,
               fromCustomerId = customerId,
-              targetCustomerId = peerConn.counterpartyId,
+              targetCustomerId = tx.counterpartyId,
               hopCount = 2,
               attenuatedRiskScore = attenuatedScore,
-              reasonCode = s"RC_302_PEER_LINK_${tag.level.toString.toUpperCase}",
+              reasonCode = exposure.reasonCode.replace("1HOP", "2HOP"),
               reasonDescription =
-                s"Peer '$customerId' transacted (${tx.txId}) with restricted entity '${tag.entityId}' [${tag.listSource}: ${tag.reasonDescription}]",
-              rootEvidenceIds = (tx.txId :: peerConn.recentTxIds).distinct,
+                s"Peer '$customerId' has prior restricted exposure (${exposure.description}) and transacted (${tx.txId}) with '${tx.counterpartyId}'",
+              rootEvidenceIds = (tx.txId :: exposure.evidenceIds).distinct,
               emittedAt = tx.timestamp,
               outboxId = Some(outboxId)
             )
@@ -125,51 +161,17 @@ class TransactionObservedPlugin(
               outboxId = outboxId,
               sourceCustomerId = customerId,
               targetType = OutboxTargetType.RiskSignalAgent,
-              targetEntityId = peerConn.counterpartyId,
+              targetEntityId = tx.counterpartyId,
               messageType = "PropagatePeerRisk",
-              payloadSummary = s"2nd-hop risk signal ${signal.signalId} to ${peerConn.counterpartyId} (score=$attenuatedScore)",
+              payloadSummary = s"2nd-hop risk signal ${signal.signalId} to ${tx.counterpartyId} (score=$attenuatedScore)",
               peerSignal = Some(signal),
               createdAt = now
             )
           }
 
-      case None if tx.counterpartyIsBankClient && tx.counterpartyId != customerId =>
-        val directExposures = updatedState.riskExposures.valuesIterator.filter(_.hopDistance == 1).toList
-        directExposures.map { exposure =>
-          val attenuatedScore =
-            BigDecimal(exposure.riskScore * secondHopAttenuation)
-              .setScale(4, BigDecimal.RoundingMode.HALF_UP)
-              .toDouble
-          val outboxId = s"OUTBOX-SIG-${tx.txId}-FROM-$customerId-TO-${tx.counterpartyId}"
-          val signal = PeerRiskSignal(
-            signalId = s"SIG-${tx.txId}-FROM-$customerId-TO-${tx.counterpartyId}",
-            originCustomerId = exposure.sourceEntityId,
-            fromCustomerId = customerId,
-            targetCustomerId = tx.counterpartyId,
-            hopCount = 2,
-            attenuatedRiskScore = attenuatedScore,
-            reasonCode = exposure.reasonCode.replace("1HOP", "2HOP"),
-            reasonDescription =
-              s"Peer '$customerId' has prior restricted exposure (${exposure.description}) and transacted (${tx.txId}) with '${tx.counterpartyId}'",
-            rootEvidenceIds = (tx.txId :: exposure.evidenceIds).distinct,
-            emittedAt = tx.timestamp,
-            outboxId = Some(outboxId)
-          )
-          OutboxEntry(
-            outboxId = outboxId,
-            sourceCustomerId = customerId,
-            targetType = OutboxTargetType.RiskSignalAgent,
-            targetEntityId = tx.counterpartyId,
-            messageType = "PropagatePeerRisk",
-            payloadSummary = s"2nd-hop risk signal ${signal.signalId} to ${tx.counterpartyId} (score=$attenuatedScore)",
-            peerSignal = Some(signal),
-            createdAt = now
-          )
-        }
+        case _ => Nil
 
-      case _ => Nil
-
-    relOutbox :: riskOutboxEntries
+      relOutbox :: riskOutboxEntries
 
 /**
  * Plugin 2: Processes `IncomeVerified` (Event 1002)
@@ -317,6 +319,68 @@ class GlobalRiskIntelligencePlugin extends SituationEventPlugin:
         throw new IllegalArgumentException(s"$pluginId cannot process ${other.eventType}")
 
 /**
+ * Plugin 7 (Doc/NowePotrzeby.md Section 2):
+ * Processes `CustomerContactChanged` — updates customer phone history and records `EMPLOYEE_CUSTOMER_PHONE_MATCH`
+ * risk exposure when the new phone number matches a bank employee (especially one servicing this customer).
+ */
+class CustomerContactChangedPlugin extends SituationEventPlugin:
+  override val pluginId: String           = "plugin.sa.customer-contact-changed.v1"
+  override val supportedEventType: String = "CustomerContactChanged"
+
+  override def process(state: CustomerSituationState, event: AgentObservedEvent): PluginProcessingResult =
+    event match
+      case CustomerContactChanged(eventId, customerId, change, occurredAt) =>
+        val updatedState = state.recordContactChange(change)
+        PluginProcessingResult(
+          updatedState = updatedState,
+          outboxEntries = Nil,
+          situationEvaluated = SituationEvaluatedRecord(
+            customerId = customerId,
+            triggerEventId = eventId,
+            triggerEventType = supportedEventType,
+            handledByPluginId = pluginId,
+            stateVersion = updatedState.stateVersion,
+            ruleVersion = updatedState.ruleVersion,
+            summary = updatedState.situationSummary,
+            completeness = updatedState.dataCompleteness,
+            evaluatedAt = occurredAt
+          )
+        )
+      case other =>
+        throw new IllegalArgumentException(s"$pluginId cannot process ${other.eventType}")
+
+/**
+ * Plugin 8 (Doc/NowePotrzeby.md Section 4.2):
+ * Processes `AccountHistoryRiskDetected` — updates customer situation with account verification history
+ * signals (such as `UNKNOWN_ACCOUNT_HISTORY` during a 1 PLN verification transfer).
+ */
+class AccountHistoryRiskPlugin extends SituationEventPlugin:
+  override val pluginId: String           = "plugin.sa.account-history-risk.v1"
+  override val supportedEventType: String = "AccountHistoryRiskDetected"
+
+  override def process(state: CustomerSituationState, event: AgentObservedEvent): PluginProcessingResult =
+    event match
+      case accEvent @ AccountHistoryRiskDetected(eventId, customerId, _, _, _, occurredAt) =>
+        val updatedState = state.recordAccountHistoryRisk(accEvent)
+        PluginProcessingResult(
+          updatedState = updatedState,
+          outboxEntries = Nil,
+          situationEvaluated = SituationEvaluatedRecord(
+            customerId = customerId,
+            triggerEventId = eventId,
+            triggerEventType = supportedEventType,
+            handledByPluginId = pluginId,
+            stateVersion = updatedState.stateVersion,
+            ruleVersion = updatedState.ruleVersion,
+            summary = updatedState.situationSummary,
+            completeness = updatedState.dataCompleteness,
+            evaluatedAt = occurredAt
+          )
+        )
+      case other =>
+        throw new IllegalArgumentException(s"$pluginId cannot process ${other.eventType}")
+
+/**
  * Configurable Registry routing incoming `AgentObservedEvent`s to the appropriate `SituationEventPlugin` (Section 2.1).
  */
 class EventPluginRegistry(
@@ -347,7 +411,9 @@ object EventPluginRegistry:
     new DebtUpdatedPlugin(),
     new CounterpartyRiskReceivedPlugin(),
     new ExternalDocumentReceivedPlugin(),
-    new GlobalRiskIntelligencePlugin()
+    new GlobalRiskIntelligencePlugin(),
+    new CustomerContactChangedPlugin(),
+    new AccountHistoryRiskPlugin()
   )
 
   val default: EventPluginRegistry = new EventPluginRegistry(defaultPlugins)

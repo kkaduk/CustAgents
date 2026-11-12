@@ -257,11 +257,30 @@ object PortfolioSituationState:
     }
 
 /**
- * Global Property Graph Vertex and Edge models stored in Oracle Exadata `SA_GRAPH` (Section 5 & 11).
+ * Global Property Graph Vertex and Edge models stored in Oracle Exadata `SA_GRAPH`
+ * (`Doc/ExaPekdoDesign.md` Section 5 & 11 + `Doc/NowePotrzeby.md` Sections 2, 3, 5).
+ *
+ * Supported vertex types:
+ * - `BANK_CUSTOMER`
+ * - `CUSTOMER_ACCOUNT` / `BANK_ACCOUNT`
+ * - `EMPLOYEE`
+ * - `PHONE_NUMBER`
+ * - `EXTERNAL_ENTITY`
+ * - `RESTRICTED_ENTITY`
+ *
+ * Supported relationship types:
+ * - `FINANCIAL_TRANSFER`
+ * - `OWN_ACCOUNT_TRANSFER`
+ * - `RESTRICTED_FLOW`
+ * - `CUSTOMER_OWNS_ACCOUNT`
+ * - `EMPLOYEE_HAS_PHONE`
+ * - `CUSTOMER_HAS_PHONE`
+ * - `EMPLOYEE_SERVICES_CUSTOMER`
+ * - `CUSTOMER_PHONE_CHANGED`
  */
 final case class GraphVertex(
     vertexId: String,
-    vertexType: String, // "BANK_CUSTOMER", "EXTERNAL_ENTITY", "RESTRICTED_ENTITY"
+    vertexType: String,
     segmentId: String,
     intrinsicRisk: Double,
     degreeCentrality: Int,
@@ -277,7 +296,31 @@ final case class GraphEdge(
     totalVolume: BigDecimal,
     txCount: Int,
     evidenceTxIds: List[String],
-    lastActiveAt: Instant
+    lastActiveAt: Instant,
+    validFrom: Option[Instant] = None,
+    validTo: Option[Instant] = None,
+    sourceSystem: String = "PAYMENT_RAILS",
+    lastEventId: Option[String] = None
+) extends Serializable
+
+/**
+ * Interactive Graph Investigation Workbench result (`Doc/NowePotrzeby.md` Section 5):
+ * Allows an analyst to start from any entity (customer, account, phone, employee, counterparty),
+ * expand relationships up to `depth` hops, filter by relationship type or time, inspect shared phones/accounts/counterparties,
+ * drill down to individual transactions, and view exact risk signal provenance.
+ */
+final case class GraphInvestigationResult(
+    rootEntityId: String,
+    depth: Int,
+    relationshipTypeFilter: Option[String],
+    vertices: List[GraphVertex],
+    edges: List[GraphEdge],
+    sharedPhones: List[String],
+    sharedAccounts: List[String],
+    sharedCounterparties: List[String],
+    employeeCustomerLinks: List[NormalizedCustomerContactChange],
+    relatedPatterns: List[NetworkRiskPatternDetected],
+    queriedAt: Instant
 ) extends Serializable
 
 /**

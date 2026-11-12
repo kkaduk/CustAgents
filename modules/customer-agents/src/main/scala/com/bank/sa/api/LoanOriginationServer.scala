@@ -93,6 +93,7 @@ class LoanOriginationServer(
                 }
                 onComplete(snapshotsFuture) {
                   case Success(snapshots) =>
+                    val repo = gateway.oracleRepository
                     val overview = SystemOverviewDto(
                       activeCustomerIds = customerIds,
                       customers = snapshots,
@@ -100,8 +101,12 @@ class LoanOriginationServer(
                       workflowTraces = gateway.getWorkflowTraces,
                       recentDecisions = gateway.getRecentDecisions,
                       registeredEventPlugins = gateway.pluginRegistry.registeredPluginIds,
-                      oracleSchemasStatus = gateway.oracleRepository.getSchemaRecordCounts,
-                      globalPatternsDetected = gateway.oracleRepository.getRiskIntelligenceEvents
+                      oracleSchemasStatus = repo.getSchemaRecordCounts,
+                      globalPatternsDetected = repo.getRiskIntelligenceEvents,
+                      recentTransferAuthorizations = repo.getTransactionAuthorizationAuditLog,
+                      accountHistoryRegistry = repo.getAccountHistoryRegistry,
+                      contactChangeHistory = repo.getContactChangeHistory,
+                      employees = repo.getEmployees
                     )
                     complete(StatusCodes.OK, overview)
                   case Failure(ex) =>
@@ -124,7 +129,11 @@ class LoanOriginationServer(
                   graphVertices = repo.getGraphVertices,
                   graphEdges = repo.getGraphEdges,
                   riskIntelligenceEvents = repo.getRiskIntelligenceEvents,
-                  governancePolicies = repo.getGovernancePolicies
+                  governancePolicies = repo.getGovernancePolicies,
+                  accountHistoryRegistry = repo.getAccountHistoryRegistry,
+                  contactChangeHistory = repo.getContactChangeHistory,
+                  employees = repo.getEmployees,
+                  transactionAuthorizations = repo.getTransactionAuthorizationAuditLog
                 )
                 complete(StatusCodes.OK, dto)
               }
@@ -245,6 +254,83 @@ class LoanOriginationServer(
                   onComplete(ingestFuture) {
                     case Success(acks) => complete(StatusCodes.OK, acks)
                     case Failure(ex)   => complete(StatusCodes.InternalServerError, Map("error" -> ex.getMessage))
+                  }
+                }
+              }
+            },
+
+            // --- NEW BUSINESS NEEDS ENDPOINTS (Doc/NowePotrzeby.md Sections 2, 3, 4, 5, 6) ---
+
+            // POST /api/v1/employees/register — Register employee profile & phone number in SA_GRAPH (Section 2)
+            path("employees" / "register") {
+              post {
+                entity(as[EmployeeRegistrationRequest]) { req =>
+                  val emp = gateway.registerEmployee(req.toDomain(Instant.now()))
+                  complete(StatusCodes.OK, emp)
+                }
+              }
+            },
+
+            // POST /api/v1/accounts/register — Register customer bank account ownership in SA_FACTS & SA_GRAPH (Section 3.3 & 4)
+            path("accounts" / "register") {
+              post {
+                entity(as[CustomerAccountRegistrationRequest]) { req =>
+                  val acc = gateway.registerCustomerAccount(req.toDomain(Instant.now()))
+                  complete(StatusCodes.OK, acc)
+                }
+              }
+            },
+
+            // POST /api/v1/customers/contact-change — Ingest customer phone change via Flink normalizer + CustomerContactChangedPlugin (Section 2)
+            path("customers" / "contact-change") {
+              post {
+                entity(as[CustomerContactChangeRequest]) { req =>
+                  onComplete(gateway.ingestCustomerContactChange(req.toDomain(Instant.now()))) {
+                    case Success(normalized) => complete(StatusCodes.OK, normalized)
+                    case Failure(ex)         => complete(StatusCodes.InternalServerError, Map("error" -> ex.getMessage))
+                  }
+                }
+              }
+            },
+
+            // POST /api/v1/accounts/verify-history — 1 PLN account history verification check + AccountHistoryRiskPlugin (Section 4)
+            path("accounts" / "verify-history") {
+              post {
+                entity(as[OnePlnAccountVerificationRequest]) { req =>
+                  val amt = Option(req.transferAmount).flatten.getOrElse(BigDecimal("1.00"))
+                  onComplete(gateway.verifyAccountForOnePlnTransfer(req.customerId, req.targetAccountId, amt, Instant.now())) {
+                    case Success(result) => complete(StatusCodes.OK, result)
+                    case Failure(ex)     => complete(StatusCodes.InternalServerError, Map("error" -> ex.getMessage))
+                  }
+                }
+              }
+            },
+
+            // GET /api/v1/accounts/{accountId}/history — Read-only account history lookup (Section 4)
+            path("accounts" / Segment / "history") { accountId =>
+              get {
+                val res = gateway.oracleRepository.verifyAccountHistory(accountId, Instant.now())
+                complete(StatusCodes.OK, res)
+              }
+            },
+
+            // GET /api/v1/graph/investigate/{entityId}?depth=2&relationType=... — Interactive Graph Investigation Workbench (Section 5)
+            path("graph" / "investigate" / Segment) { entityId =>
+              get {
+                parameters("depth".as[Int].withDefault(2), "relationType".optional) { (depth, relTypeOpt) =>
+                  val investigation = gateway.investigateGraph(entityId, depth, relTypeOpt)
+                  complete(StatusCodes.OK, investigation)
+                }
+              }
+            },
+
+            // POST /api/v1/transfers/evaluate-pre-execution — Pre-Execution Transaction Risk Decision Engine: ALLOW / REVIEW_HOLD / BLOCK (Section 6)
+            path("transfers" / "evaluate-pre-execution") {
+              post {
+                entity(as[PreExecutionTransferRequest]) { req =>
+                  onComplete(gateway.evaluateTransferBeforeExecution(req.toDomain(Instant.now()), watchlistProvider())) {
+                    case Success(decisionResp) => complete(StatusCodes.OK, decisionResp)
+                    case Failure(ex)           => complete(StatusCodes.InternalServerError, Map("error" -> ex.getMessage))
                   }
                 }
               }

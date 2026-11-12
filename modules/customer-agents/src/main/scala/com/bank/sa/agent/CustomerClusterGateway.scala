@@ -2,7 +2,8 @@ package com.bank.sa.agent
 
 import com.bank.sa.api.{LoanOriginationDecisionDto, WorkflowTraceEventDto}
 import com.bank.sa.domain.*
-import com.bank.sa.engine.ExplainableCreditEngine
+import com.bank.sa.engine.{ExplainableCreditEngine, TransactionRiskDecisionEngine}
+import com.bank.sa.enrichment.EnrichmentLogic
 import com.bank.sa.oracle.OracleExadataRepository
 import org.apache.pekko.actor.typed.ActorSystem
 import org.apache.pekko.cluster.sharding.typed.scaladsl.{ClusterSharding, Entity, EntityRef}
@@ -31,7 +32,8 @@ class CustomerClusterGateway(
     system: ActorSystem[_],
     creditEngine: ExplainableCreditEngine,
     val oracleRepository: OracleExadataRepository = new OracleExadataRepository(),
-    val pluginRegistry: EventPluginRegistry = EventPluginRegistry.default
+    val pluginRegistry: EventPluginRegistry = EventPluginRegistry.default,
+    val txRiskEngine: TransactionRiskDecisionEngine = new TransactionRiskDecisionEngine()
 ):
   private given Timeout          = Timeout(5.seconds)
   private given ExecutionContext = system.executionContext
@@ -431,6 +433,204 @@ class CustomerClusterGateway(
         .map(_ => pattern)
     }
     Future.sequence(propagationFutures)
+
+  // --- NEW BUSINESS NEEDS OPERATIONS (Doc/NowePotrzeby.md Sections 2, 3, 4, 5, 6) ---
+
+  def registerEmployee(emp: EmployeeProfile): EmployeeProfile =
+    val normalizedPhone = EnrichmentLogic.normalizePhoneNumber(emp.phoneNumberRaw)
+    val cleanEmp        = emp.copy(phoneNumberNormalized = normalizedPhone)
+    oracleRepository.registerEmployee(cleanEmp)
+    cleanEmp.servicedCustomerIds.foreach(knownCustomers.add)
+    recordTrace(
+      stage = "ORACLE_GLOBAL_GRAPH",
+      fromComponent = "HRDirectory(EmployeeRegistry)",
+      toComponent = "OracleExadata(SA_GRAPH)",
+      eventType = "EmployeeRegistered",
+      summary =
+        s"Registered employee '${cleanEmp.employeeId}' (${cleanEmp.fullName}, phone=$normalizedPhone) servicing [${cleanEmp.servicedCustomerIds.mkString(", ")}]",
+      details = Map(
+        "employeeId" -> cleanEmp.employeeId,
+        "fullName" -> cleanEmp.fullName,
+        "phoneNumber" -> normalizedPhone,
+        "servicedCustomers" -> cleanEmp.servicedCustomerIds.mkString(", ")
+      ),
+      timestamp = cleanEmp.registeredAt
+    )
+    cleanEmp
+
+  def registerCustomerAccount(account: CustomerAccount): CustomerAccount =
+    knownCustomers.add(account.customerId)
+    oracleRepository.registerCustomerAccount(account)
+    recordTrace(
+      stage = "ORACLE_GLOBAL_GRAPH",
+      fromComponent = "CoreBanking(Accounts)",
+      toComponent = "OracleExadata(SA_FACTS + SA_GRAPH)",
+      eventType = "CustomerAccountRegistered (AccountFirstSeen)",
+      summary = s"Registered account '${account.accountId}' owned by '${account.customerId}' (${account.accountType}, ${account.currency})",
+      details = Map(
+        "accountId" -> account.accountId,
+        "customerId" -> account.customerId,
+        "accountType" -> account.accountType
+      ),
+      timestamp = account.openedAt
+    )
+    account
+
+  /**
+   * Section 2 of Doc/NowePotrzeby.md:
+   * 1. Customer phone change arrives on Kafka.
+   * 2. Flink normalizes phone number and checks employee phone match.
+   * 3. Updates `SA_GRAPH` (`CUSTOMER_HAS_PHONE`, `CUSTOMER_PHONE_CHANGED`) with validity & provenance.
+   * 4. Routes `CustomerContactChanged` to `CustomerAgent` via `CustomerContactChangedPlugin`.
+   */
+  def ingestCustomerContactChange(raw: RawCustomerContactChange): Future[NormalizedCustomerContactChange] =
+    knownCustomers.add(raw.customerId)
+    val normalized = EnrichmentLogic.normalizeContactChange(raw, oracleRepository.getEmployees)
+    oracleRepository.projectContactChange(normalized)
+
+    recordTrace(
+      stage = "FLINK_ENRICHMENT",
+      fromComponent = "Kafka(customer.contact.changes.v1)",
+      toComponent = "Flink(ContactPhoneNormalizer) -> SA_GRAPH",
+      eventType =
+        if normalized.matchedEmployeeId.isDefined then "EMPLOYEE_CUSTOMER_PHONE_MATCH"
+        else "CustomerContactNormalized",
+      summary =
+        s"Flink normalized phone change for '${raw.customerId}' ('${raw.newPhoneRaw}' -> '${normalized.newPhoneNormalized}')" +
+          normalized.matchedEmployeeId.fold("")(empId =>
+            s" [ALERT: Matches employee '$empId', servicesCustomer=${normalized.employeeServicesCustomer}]"
+          ),
+      details = Map(
+        "eventId" -> normalized.eventId,
+        "customerId" -> normalized.customerId,
+        "previousPhone" -> normalized.previousPhoneNormalized.getOrElse("NONE"),
+        "newPhoneNormalized" -> normalized.newPhoneNormalized,
+        "matchedEmployeeId" -> normalized.matchedEmployeeId.getOrElse("NONE"),
+        "employeeServicesCustomer" -> normalized.employeeServicesCustomer.toString,
+        "sourceSystem" -> normalized.sourceSystem
+      ),
+      timestamp = normalized.occurredAt
+    )
+
+    val observedEvent = CustomerContactChanged(
+      eventId = normalized.eventId,
+      customerId = normalized.customerId,
+      change = normalized,
+      occurredAt = normalized.occurredAt
+    )
+    entityFor(normalized.customerId)
+      .ask[CustomerAgent.IngestionAck](replyTo => CustomerAgent.IngestObservedEvent(observedEvent, replyTo))
+      .map(_ => normalized)
+
+  /**
+   * Section 4 of Doc/NowePotrzeby.md:
+   * Verifies recipient account history (e.g. during a 1 PLN verification transfer) against `SA_FACTS` & `SA_GRAPH`
+   * and feeds `AccountHistoryRiskDetected` back to `CustomerAgent` via `AccountHistoryRiskPlugin`.
+   */
+  def verifyAccountForOnePlnTransfer(
+      customerId: String,
+      targetAccountId: String,
+      transferAmount: BigDecimal = BigDecimal("1.00"),
+      now: Instant = Instant.now()
+  ): Future[AccountVerificationResult] =
+    knownCustomers.add(customerId)
+    val verification = oracleRepository.verifyAccountHistory(targetAccountId, now)
+
+    recordTrace(
+      stage = "ORACLE_GLOBAL_GRAPH",
+      fromComponent = s"AccountVerifier($customerId)",
+      toComponent = "OracleExadata(SA_FACTS.ACCOUNT_HISTORY_REGISTRY)",
+      eventType = s"AccountVerification (${if verification.knownInBank then "KNOWN" else "UNKNOWN_ACCOUNT_HISTORY"})",
+      summary =
+        s"1 PLN Account Check for '$targetAccountId': knownInBank=${verification.knownInBank}, txCount=${verification.transactionCount}, signal=${verification.riskSignalCode.getOrElse("NONE")}",
+      details = Map(
+        "accountId" -> targetAccountId,
+        "knownInBank" -> verification.knownInBank.toString,
+        "firstSeenAt" -> verification.firstSeenAt.map(_.toString).getOrElse("Brak w dostępnej historii"),
+        "transactionCount" -> verification.transactionCount.toString,
+        "riskSignalCode" -> verification.riskSignalCode.getOrElse("NONE"),
+        "assessment" -> verification.assessment
+      ),
+      timestamp = now
+    )
+
+    if verification.riskSignalCode.isDefined || !verification.knownInBank then
+      val observed = AccountHistoryRiskDetected(
+        eventId = s"EVT-ACC-CHK-${targetAccountId.replaceAll("[^A-Za-z0-9]", "")}-${now.toEpochMilli}",
+        customerId = customerId,
+        targetAccountId = targetAccountId,
+        verification = verification,
+        transferAmount = transferAmount,
+        occurredAt = now
+      )
+      entityFor(customerId)
+        .ask[CustomerAgent.IngestionAck](replyTo => CustomerAgent.IngestObservedEvent(observed, replyTo))
+        .map(_ => verification)
+    else
+      Future.successful(verification)
+
+  /**
+   * Section 6 of Doc/NowePotrzeby.md:
+   * Evaluates a proposed transfer BEFORE execution using the pre-computed `CustomerSituationState` in `CustomerAgent`
+   * without running an expensive global graph traversal on the payment authorization critical path.
+   */
+  def evaluateTransferBeforeExecution(
+      transfer: ProposedPaymentTransfer,
+      watchlist: Map[String, RestrictedEntityTag] = Map.empty
+  ): Future[TransactionAuthorizationResponse] =
+    val stateFuture: Future[Option[CustomerSituationState]] =
+      getSituationState(transfer.customerId).map(Some(_)).recover { case _ => None }
+
+    stateFuture.map { stateOpt =>
+      val accountVerification = oracleRepository.verifyAccountHistory(transfer.toAccountId, transfer.requestedAt)
+      val restrictedTagOpt    = watchlist.get(transfer.toCounterpartyId).orElse(watchlist.get(transfer.toAccountId))
+      val suspectedMules = oracleRepository.getRiskIntelligenceEvents
+        .filter(_.reasonCode == "SUSPECTED_MULE_ACCOUNT")
+        .flatMap(p => p.sharedEntityId :: p.linkedCustomers)
+        .toSet
+
+      val response = txRiskEngine.evaluateTransferBeforeExecution(
+        transfer = transfer,
+        customerStateOpt = stateOpt,
+        accountVerification = accountVerification,
+        restrictedCounterpartyTag = restrictedTagOpt,
+        suspectedMuleEntities = suspectedMules
+      )
+
+      oracleRepository.recordTransactionAuthorizationAudit(response)
+
+      recordTrace(
+        stage = "EXPLAINABLE_ENGINE",
+        fromComponent = s"CustomerAgent(${transfer.customerId})",
+        toComponent = "TransactionRiskDecisionEngine",
+        eventType = s"PreExecutionTransferDecision (${response.decision})",
+        summary =
+          s"Pre-execution check for '${transfer.transferId}' (${transfer.amount} ${transfer.currency} -> ${transfer.toAccountId}): ${response.decision} | RiskScore=${response.riskScore}/100 | Directive=${response.paymentRailDirective}",
+        details = Map(
+          "transferId" -> response.transferId,
+          "customerId" -> response.customerId,
+          "toAccountId" -> response.toAccountId,
+          "toCounterpartyId" -> response.toCounterpartyId,
+          "decision" -> response.decision.toString,
+          "riskScore" -> s"${response.riskScore}/100",
+          "reasonCodes" -> (if response.principalReasons.isEmpty then "NONE" else response.principalReasons.map(_.code).mkString(", ")),
+          "paymentRailDirective" -> response.paymentRailDirective
+        ),
+        timestamp = transfer.requestedAt
+      )
+      response
+    }
+
+  /**
+   * Section 5 of Doc/NowePotrzeby.md:
+   * Interactive Graph Investigation Workbench query for human fraud/AML analysts.
+   */
+  def investigateGraph(
+      rootEntityId: String,
+      depth: Int = 2,
+      relationshipTypeFilter: Option[String] = None
+  ): GraphInvestigationResult =
+    oracleRepository.investigateGraph(rootEntityId, depth, relationshipTypeFilter, Instant.now())
 
   def getSituationState(customerId: String): Future[CustomerSituationState] =
     entityFor(customerId).ask(replyTo => CustomerAgent.GetSituationState(replyTo))

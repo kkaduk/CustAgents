@@ -15,6 +15,7 @@ enum TransactionCategory:
   case CryptoExchange
   case PeerTransfer
   case HighRiskTransfer
+  case InternalOwnAccountTransfer
 
   def isHighRiskCategory: Boolean = this match
     case Gambling | HighRiskTransfer => true
@@ -45,7 +46,9 @@ final case class RawTransaction(
     category: TransactionCategory,
     resultsInOverdraft: Boolean,
     timestamp: Instant,
-    merchantDescription: Option[String] = None
+    merchantDescription: Option[String] = None,
+    fromAccountId: Option[String] = None,
+    toAccountId: Option[String] = None
 ) extends Serializable
 
 /**
@@ -64,7 +67,85 @@ final case class EnrichedTransaction(
     resultsInOverdraft: Boolean,
     restrictedTag: Option[RestrictedEntityTag],
     timestamp: Instant,
-    categorizerSource: String = "ExternalCategorizerModule"
+    categorizerSource: String = "ExternalCategorizerModule",
+    fromAccountId: Option[String] = None,
+    toAccountId: Option[String] = None,
+    isOwnAccountTransfer: Boolean = false
+) extends Serializable
+
+// =============================================================================
+// NEW BUSINESS NEEDS MODELS (Doc/NowePotrzeby.md Sections 2, 3, 4, 5, 6)
+// =============================================================================
+
+/** Bank account owned by a customer (`CUSTOMER_ACCOUNT` / `BANK_ACCOUNT` in `SA_GRAPH`, Section 2 & 3.3). */
+final case class CustomerAccount(
+    accountId: String,
+    customerId: String,
+    accountType: String = "CHECKING",
+    currency: String = "PLN",
+    openedAt: Instant = Instant.EPOCH
+) extends Serializable
+
+/** Bank employee profile (`EMPLOYEE` vertex in `SA_GRAPH`, Section 2). */
+final case class EmployeeProfile(
+    employeeId: String,
+    fullName: String,
+    role: String,
+    branchId: String,
+    phoneNumberRaw: String,
+    phoneNumberNormalized: String,
+    servicedCustomerIds: List[String],
+    registeredAt: Instant
+) extends Serializable
+
+/** Raw customer contact/phone change event arriving on Kafka (Section 2). */
+final case class RawCustomerContactChange(
+    eventId: String,
+    customerId: String,
+    previousPhoneRaw: Option[String],
+    newPhoneRaw: String,
+    sourceSystem: String = "CRM-CONTACT-REGISTRY",
+    changedByEmployeeId: Option[String] = None,
+    occurredAt: Instant = Instant.now()
+) extends Serializable
+
+/** Flink-normalized customer contact change with employee phone match resolution (Section 2). */
+final case class NormalizedCustomerContactChange(
+    eventId: String,
+    customerId: String,
+    previousPhoneNormalized: Option[String],
+    newPhoneNormalized: String,
+    sourceSystem: String,
+    changedByEmployeeId: Option[String],
+    matchedEmployeeId: Option[String] = None,
+    matchedEmployeeName: Option[String] = None,
+    employeeServicesCustomer: Boolean = false,
+    occurredAt: Instant
+) extends Serializable
+
+/** First-seen account record (`AccountFirstSeen` in Section 4.1). */
+final case class AccountFirstSeen(
+    accountId: String,
+    firstObservedTxId: String,
+    firstObservedCustomerId: String,
+    firstSeenAt: Instant
+) extends Serializable
+
+/** Account history & 1 PLN verification result (`SA_FACTS` & `SA_GRAPH`, Section 4). */
+final case class AccountVerificationResult(
+    accountId: String,
+    knownInBank: Boolean,
+    ownerCustomerId: Option[String],
+    firstSeenAt: Option[Instant],
+    lastSeenAt: Option[Instant],
+    transactionCount: Int,
+    totalVolume: BigDecimal,
+    linkedCustomers: List[String],
+    highRiskConnections: List[String],
+    suspiciousTxIds: List[String],
+    assessment: String,
+    riskSignalCode: Option[String],
+    checkedAt: Instant
 ) extends Serializable
 
 enum DocumentFactType:
@@ -104,7 +185,8 @@ final case class PeerRiskSignal(
 ) extends Serializable
 
 /**
- * Global Graph Risk Intelligence pattern types detected by Oracle Exadata Property Graph (`SA_GRAPH` / `SA_INTELLIGENCE`, Section 5 & 14).
+ * Global Graph Risk Intelligence pattern types detected by Oracle Exadata Property Graph
+ * (`SA_GRAPH` / `SA_INTELLIGENCE`, Doc/ExaPekdoDesign.md Section 5 & 14 + Doc/NowePotrzeby.md Section 2 & 3.2).
  */
 enum NetworkRiskPatternType:
   case SharedHighRiskCounterparty
@@ -112,6 +194,11 @@ enum NetworkRiskPatternType:
   case SegmentRiskConcentration
   case HighDegreeNodeExposure
   case OrganizedRiskCommunity
+  case RapidPassThrough
+  case FanInFanOut
+  case MultiHopMoneyMovement
+  case CircularTransfers
+  case EmployeeCustomerPhoneMatch
 
 /**
  * Risk intelligence event emitted by Oracle Exadata Global Relationship Graph analysis (`NetworkRiskPatternDetected`, Section 5 & 14)
@@ -195,6 +282,50 @@ final case class GlobalRiskIntelligenceReceived(
     occurredAt: Instant
 ) extends AgentObservedEvent:
   override val eventType: String = "NetworkRiskPatternDetected"
+
+/**
+ * Event 1007 (Doc/NowePotrzeby.md Section 2):
+ * Customer phone/contact changed — routed to `CustomerContactChangedPlugin` via `EventPluginRegistry`.
+ */
+final case class CustomerContactChanged(
+    eventId: String,
+    customerId: String,
+    change: NormalizedCustomerContactChange,
+    occurredAt: Instant
+) extends AgentObservedEvent:
+  override val eventType: String = "CustomerContactChanged"
+
+/**
+ * Event 1008 (Doc/NowePotrzeby.md Section 4.2):
+ * Account history verification risk signal (e.g. 1 PLN verification transfer to unknown or high-risk account)
+ * routed to `AccountHistoryRiskPlugin` via `EventPluginRegistry`.
+ */
+final case class AccountHistoryRiskDetected(
+    eventId: String,
+    customerId: String,
+    targetAccountId: String,
+    verification: AccountVerificationResult,
+    transferAmount: BigDecimal,
+    occurredAt: Instant
+) extends AgentObservedEvent:
+  override val eventType: String = "AccountHistoryRiskDetected"
+
+/**
+ * Pre-execution payment transfer order evaluated by `TransactionRiskDecisionEngine` BEFORE payment execution
+ * (Doc/NowePotrzeby.md Section 6).
+ */
+final case class ProposedPaymentTransfer(
+    transferId: String,
+    customerId: String,
+    fromAccountId: Option[String],
+    toAccountId: String,
+    toCounterpartyId: String,
+    amount: BigDecimal,
+    currency: String = "PLN",
+    title: String = "",
+    isVerificationOnePlnTransfer: Boolean = false,
+    requestedAt: Instant = Instant.now()
+) extends Serializable
 
 /**
  * Transactional Outbox entry persisted atomically with the agent's journal event

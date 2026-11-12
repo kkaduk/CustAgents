@@ -110,21 +110,27 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
   private val persistenceOutbox    = new ConcurrentHashMap[String, OutboxEntry]()
 
   // 2. SA_FACTS
-  private val financialTxFacts     = new ConcurrentLinkedDeque[FinancialTransactionFactRow]()
-  private val verifiedDocFacts     = new ConcurrentHashMap[String, VerifiedDocumentFact]()
-  private val debtObligationFacts  = new ConcurrentHashMap[String, VerifiedDocumentFact]()
+  private val financialTxFacts       = new ConcurrentLinkedDeque[FinancialTransactionFactRow]()
+  private val verifiedDocFacts       = new ConcurrentHashMap[String, VerifiedDocumentFact]()
+  private val debtObligationFacts    = new ConcurrentHashMap[String, VerifiedDocumentFact]()
+  private val customerAccounts       = new ConcurrentHashMap[String, CustomerAccount]()
+  private val accountFirstSeenMap    = new ConcurrentHashMap[String, AccountFirstSeen]()
+  private val accountHistoryMap      = new ConcurrentHashMap[String, AccountVerificationResult]()
+  private val employeeRegistry       = new ConcurrentHashMap[String, EmployeeProfile]()
+  private val contactChangeHistory   = new ConcurrentLinkedDeque[NormalizedCustomerContactChange]()
 
   // 3. SA_GRAPH (Oracle Property Graph: Vertices & Edges)
-  private val graphVertices        = new ConcurrentHashMap[String, GraphVertex]()
-  private val graphEdges           = new ConcurrentHashMap[String, GraphEdge]()
+  private val graphVertices          = new ConcurrentHashMap[String, GraphVertex]()
+  private val graphEdges             = new ConcurrentHashMap[String, GraphEdge]()
 
   // 4. SA_INTELLIGENCE (Global Risk Intelligence & Portfolio Analytics)
-  private val riskIntelEvents      = new ConcurrentLinkedDeque[NetworkRiskPatternDetected]()
-  private val portfolioSnapshots   = new ConcurrentHashMap[String, PortfolioSituationState]()
+  private val riskIntelEvents        = new ConcurrentLinkedDeque[NetworkRiskPatternDetected]()
+  private val portfolioSnapshots     = new ConcurrentHashMap[String, PortfolioSituationState]()
 
-  // 5. SA_DECISIONS (Persisted Evaluations & Projections)
-  private val decisionAuditLog     = new ConcurrentLinkedDeque[LoanDecisionResponse]()
-  private val projectionAuditLog   = new ConcurrentLinkedDeque[SituationProjection]()
+  // 5. SA_DECISIONS (Persisted Evaluations, Projections & Pre-Execution Transaction Authorizations)
+  private val decisionAuditLog       = new ConcurrentLinkedDeque[LoanDecisionResponse]()
+  private val projectionAuditLog     = new ConcurrentLinkedDeque[SituationProjection]()
+  private val txAuthorizationAuditLog = new ConcurrentLinkedDeque[TransactionAuthorizationResponse]()
 
   // 6. SA_GOVERNANCE (Rule Versions, Models, Policies)
   private val governancePolicies   = new ConcurrentHashMap[String, GovernancePolicyRow]()
@@ -340,6 +346,41 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
             |  IS_AFFORDABLE NUMBER(1) NOT NULL,
             |  PROJECTED_AT TIMESTAMP WITH TIME ZONE NOT NULL,
             |  CONSTRAINT PK_SA_PROJ_LOG PRIMARY KEY (APPLICATION_ID)
+            |)""".stripMargin,
+          """CREATE TABLE SA_FACTS.ACCOUNT_HISTORY_REGISTRY (
+            |  ACCOUNT_ID VARCHAR2(128 CHAR) NOT NULL,
+            |  OWNER_CUSTOMER_ID VARCHAR2(128 CHAR),
+            |  FIRST_SEEN_AT TIMESTAMP WITH TIME ZONE NOT NULL,
+            |  LAST_SEEN_AT TIMESTAMP WITH TIME ZONE NOT NULL,
+            |  TX_COUNT NUMBER(10) NOT NULL,
+            |  TOTAL_VOLUME NUMBER(19, 4) NOT NULL,
+            |  LINKED_CUSTOMERS VARCHAR2(2000 CHAR),
+            |  HIGH_RISK_CONNECTIONS VARCHAR2(2000 CHAR),
+            |  CONSTRAINT PK_SA_ACCOUNT_HISTORY PRIMARY KEY (ACCOUNT_ID)
+            |)""".stripMargin,
+          """CREATE TABLE SA_FACTS.CONTACT_CHANGE_HISTORY (
+            |  EVENT_ID VARCHAR2(128 CHAR) NOT NULL,
+            |  CUSTOMER_ID VARCHAR2(128 CHAR) NOT NULL,
+            |  PREV_PHONE VARCHAR2(64 CHAR),
+            |  NEW_PHONE VARCHAR2(64 CHAR) NOT NULL,
+            |  MATCHED_EMPLOYEE_ID VARCHAR2(128 CHAR),
+            |  SERVICES_CUSTOMER NUMBER(1) NOT NULL,
+            |  SOURCE_SYSTEM VARCHAR2(128 CHAR) NOT NULL,
+            |  OCCURRED_AT TIMESTAMP WITH TIME ZONE NOT NULL,
+            |  CONSTRAINT PK_SA_CONTACT_CHANGE PRIMARY KEY (EVENT_ID)
+            |)""".stripMargin,
+          """CREATE TABLE SA_DECISIONS.TRANSACTION_AUTHORIZATION_LOG (
+            |  TRANSFER_ID VARCHAR2(128 CHAR) NOT NULL,
+            |  CUSTOMER_ID VARCHAR2(128 CHAR) NOT NULL,
+            |  TO_ACCOUNT_ID VARCHAR2(128 CHAR) NOT NULL,
+            |  TO_COUNTERPARTY_ID VARCHAR2(128 CHAR) NOT NULL,
+            |  AMOUNT NUMBER(19, 4) NOT NULL,
+            |  DECISION_STATUS VARCHAR2(32 CHAR) NOT NULL,
+            |  RISK_SCORE NUMBER(10) NOT NULL,
+            |  REASON_CODES VARCHAR2(1000 CHAR),
+            |  RAIL_DIRECTIVE VARCHAR2(128 CHAR) NOT NULL,
+            |  EVALUATED_AT TIMESTAMP WITH TIME ZONE NOT NULL,
+            |  CONSTRAINT PK_SA_TX_AUTH_LOG PRIMARY KEY (TRANSFER_ID)
             |)""".stripMargin,
           """CREATE TABLE SA_DECISIONS.DECISION_AUDIT_LOG (
             |  APPLICATION_ID VARCHAR2(128 CHAR) NOT NULL,
@@ -615,56 +656,310 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
       }
     }
 
+  // --- 2b. ACCOUNT OWNERSHIP, 1 PLN ACCOUNT HISTORY & EMPLOYEE/CONTACT OPERATIONS (Doc/NowePotrzeby.md Sections 2, 3.3, 4) ---
+
+  def registerCustomerAccount(account: CustomerAccount): CustomerAccount =
+    customerAccounts.put(account.accountId, account)
+    upsertVertex(account.accountId, "CUSTOMER_ACCOUNT", 0.0, account.openedAt)
+    upsertVertex(account.customerId, "BANK_CUSTOMER", 0.0, account.openedAt)
+    upsertEdge(
+      edgeId = s"OWNS:${account.customerId}->${account.accountId}",
+      sourceVertexId = account.customerId,
+      targetVertexId = account.accountId,
+      relationshipType = "CUSTOMER_OWNS_ACCOUNT",
+      volumeDelta = BigDecimal(0),
+      txCountDelta = 0,
+      evidenceIdOpt = Some(s"ACC-OPEN-${account.accountId}"),
+      at = account.openedAt,
+      validFrom = Some(account.openedAt),
+      sourceSystem = "CORE_BANKING_ACCOUNTS"
+    )
+    recordAccountObservation(
+      accountId = account.accountId,
+      ownerCustomerIdOpt = Some(account.customerId),
+      linkedCustomerOpt = Some(account.customerId),
+      txIdOpt = None,
+      amount = BigDecimal(0),
+      highRiskEntityOpt = None,
+      observedAt = account.openedAt
+    )
+    account
+
+  def registerEmployee(emp: EmployeeProfile): EmployeeProfile =
+    employeeRegistry.put(emp.employeeId, emp)
+    val phoneVertexId = s"PHONE:${emp.phoneNumberNormalized}"
+    upsertVertex(emp.employeeId, "EMPLOYEE", 0.0, emp.registeredAt)
+    upsertVertex(phoneVertexId, "PHONE_NUMBER", 0.0, emp.registeredAt)
+    upsertEdge(
+      edgeId = s"EMP_PHONE:${emp.employeeId}->$phoneVertexId",
+      sourceVertexId = emp.employeeId,
+      targetVertexId = phoneVertexId,
+      relationshipType = "EMPLOYEE_HAS_PHONE",
+      volumeDelta = BigDecimal(0),
+      txCountDelta = 1,
+      evidenceIdOpt = Some(s"HR-REG-${emp.employeeId}"),
+      at = emp.registeredAt,
+      validFrom = Some(emp.registeredAt),
+      sourceSystem = "HR_DIRECTORY"
+    )
+    emp.servicedCustomerIds.foreach { cid =>
+      upsertVertex(cid, "BANK_CUSTOMER", 0.0, emp.registeredAt)
+      upsertEdge(
+        edgeId = s"EMP_SERVICES:${emp.employeeId}->$cid",
+        sourceVertexId = emp.employeeId,
+        targetVertexId = cid,
+        relationshipType = "EMPLOYEE_SERVICES_CUSTOMER",
+        volumeDelta = BigDecimal(0),
+        txCountDelta = 1,
+        evidenceIdOpt = Some(s"CRM-ASSIGN-${emp.employeeId}-$cid"),
+        at = emp.registeredAt,
+        validFrom = Some(emp.registeredAt),
+        sourceSystem = "CRM_ASSIGNMENT"
+      )
+    }
+    emp
+
+  def projectContactChange(change: NormalizedCustomerContactChange): NormalizedCustomerContactChange =
+    contactChangeHistory.addFirst(change)
+    while contactChangeHistory.size() > 200 do contactChangeHistory.removeLast()
+
+    val newPhoneVertexId = s"PHONE:${change.newPhoneNormalized}"
+    val phoneRisk        = if change.matchedEmployeeId.isDefined then 0.65 else 0.0
+    upsertVertex(change.customerId, "BANK_CUSTOMER", phoneRisk * 0.5, change.occurredAt)
+    upsertVertex(newPhoneVertexId, "PHONE_NUMBER", phoneRisk, change.occurredAt)
+
+    change.previousPhoneNormalized.filter(_.nonEmpty).foreach { prevPhone =>
+      val prevPhoneVertexId = s"PHONE:$prevPhone"
+      upsertVertex(prevPhoneVertexId, "PHONE_NUMBER", 0.0, change.occurredAt)
+      val prevEdgeKey = s"CUST_PHONE:${change.customerId}->$prevPhoneVertexId"
+      Option(graphEdges.get(prevEdgeKey)).foreach { existing =>
+        graphEdges.put(prevEdgeKey, existing.copy(validTo = Some(change.occurredAt)))
+      }
+      upsertEdge(
+        edgeId = s"PHONE_CHANGE:${change.customerId}:$prevPhoneVertexId->$newPhoneVertexId",
+        sourceVertexId = prevPhoneVertexId,
+        targetVertexId = newPhoneVertexId,
+        relationshipType = "CUSTOMER_PHONE_CHANGED",
+        volumeDelta = BigDecimal(0),
+        txCountDelta = 1,
+        evidenceIdOpt = Some(change.eventId),
+        at = change.occurredAt,
+        validFrom = Some(change.occurredAt),
+        sourceSystem = change.sourceSystem,
+        lastEventId = Some(change.eventId)
+      )
+    }
+
+    upsertEdge(
+      edgeId = s"CUST_PHONE:${change.customerId}->$newPhoneVertexId",
+      sourceVertexId = change.customerId,
+      targetVertexId = newPhoneVertexId,
+      relationshipType = "CUSTOMER_HAS_PHONE",
+      volumeDelta = BigDecimal(0),
+      txCountDelta = 1,
+      evidenceIdOpt = Some(change.eventId),
+      at = change.occurredAt,
+      validFrom = Some(change.occurredAt),
+      sourceSystem = change.sourceSystem,
+      lastEventId = Some(change.eventId)
+    )
+
+    withJdbcConnection { conn =>
+      val sql =
+        """MERGE INTO SA_FACTS.CONTACT_CHANGE_HISTORY t
+          |USING (SELECT ? AS eid FROM dual) s ON (t.EVENT_ID = s.eid)
+          |WHEN NOT MATCHED THEN INSERT
+          |  (EVENT_ID, CUSTOMER_ID, PREV_PHONE, NEW_PHONE, MATCHED_EMPLOYEE_ID, SERVICES_CUSTOMER, SOURCE_SYSTEM, OCCURRED_AT)
+          |VALUES (?, ?, ?, ?, ?, ?, ?, ?)""".stripMargin
+      Using.resource(conn.prepareStatement(sql)) { ps =>
+        ps.setString(1, change.eventId)
+        ps.setString(2, change.eventId)
+        ps.setString(3, change.customerId)
+        ps.setString(4, change.previousPhoneNormalized.orNull)
+        ps.setString(5, change.newPhoneNormalized)
+        ps.setString(6, change.matchedEmployeeId.orNull)
+        ps.setInt(7, if change.employeeServicesCustomer then 1 else 0)
+        ps.setString(8, change.sourceSystem)
+        ps.setTimestamp(9, Timestamp.from(change.occurredAt))
+        ps.executeUpdate()
+      }
+    }
+    change
+
+  private def recordAccountObservation(
+      accountId: String,
+      ownerCustomerIdOpt: Option[String],
+      linkedCustomerOpt: Option[String],
+      txIdOpt: Option[String],
+      amount: BigDecimal,
+      highRiskEntityOpt: Option[String],
+      observedAt: Instant
+  ): Unit =
+    if accountId.nonEmpty then
+      accountFirstSeenMap.computeIfAbsent(
+        accountId,
+        _ =>
+          AccountFirstSeen(
+            accountId = accountId,
+            firstObservedTxId = txIdOpt.getOrElse("ACCOUNT_REGISTRATION"),
+            firstObservedCustomerId = ownerCustomerIdOpt.orElse(linkedCustomerOpt).getOrElse("UNKNOWN"),
+            firstSeenAt = observedAt
+          )
+      )
+      val firstSeen = accountFirstSeenMap.get(accountId)
+      val existing  = Option(accountHistoryMap.get(accountId))
+      val updated = existing match
+        case Some(prev) =>
+          val mergedOwner = prev.ownerCustomerId.orElse(ownerCustomerIdOpt).orElse(Option(customerAccounts.get(accountId)).map(_.customerId))
+          val mergedLinked = (prev.linkedCustomers ++ linkedCustomerOpt.toList ++ ownerCustomerIdOpt.toList).distinct.take(25)
+          val mergedRisk   = (prev.highRiskConnections ++ highRiskEntityOpt.toList).distinct.take(25)
+          val mergedSuspTx =
+            if highRiskEntityOpt.isDefined then (txIdOpt.toList ++ prev.suspiciousTxIds).distinct.take(25)
+            else prev.suspiciousTxIds
+          val earliest = if observedAt.isBefore(prev.firstSeenAt.getOrElse(observedAt)) then observedAt else prev.firstSeenAt.getOrElse(observedAt)
+          val latest   = if observedAt.isAfter(prev.lastSeenAt.getOrElse(observedAt)) then observedAt else prev.lastSeenAt.getOrElse(observedAt)
+          val txCount  = if txIdOpt.isDefined then prev.transactionCount + 1 else prev.transactionCount
+          prev.copy(
+            knownInBank = true,
+            ownerCustomerId = mergedOwner,
+            firstSeenAt = Some(earliest),
+            lastSeenAt = Some(latest),
+            transactionCount = txCount,
+            totalVolume = prev.totalVolume + amount,
+            linkedCustomers = mergedLinked,
+            highRiskConnections = mergedRisk,
+            suspiciousTxIds = mergedSuspTx,
+            assessment =
+              if mergedRisk.nonEmpty then s"Rachunek znany w banku, lecz powiązany z podmiotami podwyższonego ryzyka (${mergedRisk.mkString(", ")})"
+              else "Rachunek znany w banku — potwierdzona historia transakcji",
+            riskSignalCode = if mergedRisk.nonEmpty then Some("SUSPECTED_MULE_ACCOUNT") else None,
+            checkedAt = latest
+          )
+        case None =>
+          val owner = ownerCustomerIdOpt.orElse(Option(customerAccounts.get(accountId)).map(_.customerId))
+          val riskList = highRiskEntityOpt.toList
+          AccountVerificationResult(
+            accountId = accountId,
+            knownInBank = true,
+            ownerCustomerId = owner,
+            firstSeenAt = Some(firstSeen.firstSeenAt),
+            lastSeenAt = Some(observedAt),
+            transactionCount = if txIdOpt.isDefined then 1 else 0,
+            totalVolume = amount,
+            linkedCustomers = (linkedCustomerOpt.toList ++ owner.toList).distinct,
+            highRiskConnections = riskList,
+            suspiciousTxIds = if highRiskEntityOpt.isDefined then txIdOpt.toList else Nil,
+            assessment =
+              if riskList.nonEmpty then s"Rachunek powiązany z podmiotem wysokiego ryzyka (${riskList.mkString(", ")})"
+              else "Rachunek znany w banku — potwierdzona historia transakcji",
+            riskSignalCode = if riskList.nonEmpty then Some("SUSPECTED_MULE_ACCOUNT") else None,
+            checkedAt = observedAt
+          )
+      accountHistoryMap.put(accountId, updated)
+
+      withJdbcConnection { conn =>
+        val sql =
+          """MERGE INTO SA_FACTS.ACCOUNT_HISTORY_REGISTRY t
+            |USING (SELECT ? AS aid FROM dual) s ON (t.ACCOUNT_ID = s.aid)
+            |WHEN MATCHED THEN UPDATE SET
+            |  OWNER_CUSTOMER_ID = ?, LAST_SEEN_AT = ?, TX_COUNT = ?, TOTAL_VOLUME = ?, LINKED_CUSTOMERS = ?, HIGH_RISK_CONNECTIONS = ?
+            |WHEN NOT MATCHED THEN INSERT
+            |  (ACCOUNT_ID, OWNER_CUSTOMER_ID, FIRST_SEEN_AT, LAST_SEEN_AT, TX_COUNT, TOTAL_VOLUME, LINKED_CUSTOMERS, HIGH_RISK_CONNECTIONS)
+            |VALUES (?, ?, ?, ?, ?, ?, ?, ?)""".stripMargin
+        Using.resource(conn.prepareStatement(sql)) { ps =>
+          val fTs = Timestamp.from(updated.firstSeenAt.getOrElse(observedAt))
+          val lTs = Timestamp.from(updated.lastSeenAt.getOrElse(observedAt))
+          val linkedStr = updated.linkedCustomers.mkString(",")
+          val riskStr   = updated.highRiskConnections.mkString(",")
+          ps.setString(1, accountId)
+          ps.setString(2, updated.ownerCustomerId.orNull)
+          ps.setTimestamp(3, lTs)
+          ps.setInt(4, updated.transactionCount)
+          ps.setBigDecimal(5, updated.totalVolume.bigDecimal)
+          ps.setString(6, linkedStr)
+          ps.setString(7, riskStr)
+          ps.setString(8, accountId)
+          ps.setString(9, updated.ownerCustomerId.orNull)
+          ps.setTimestamp(10, fTs)
+          ps.setTimestamp(11, lTs)
+          ps.setInt(12, updated.transactionCount)
+          ps.setBigDecimal(13, updated.totalVolume.bigDecimal)
+          ps.setString(14, linkedStr)
+          ps.setString(15, riskStr)
+          ps.executeUpdate()
+        }
+      }
+
+  /**
+   * Verifies account history for a 1 PLN verification transfer or pre-execution payment check (`Doc/NowePotrzeby.md` Section 4).
+   * Distinguishes a known account with history from an account never previously observed by the bank (`UNKNOWN_ACCOUNT_HISTORY`).
+   */
+  def verifyAccountHistory(accountId: String, now: Instant = Instant.now()): AccountVerificationResult =
+    Option(accountHistoryMap.get(accountId)) match
+      case Some(existing) =>
+        existing.copy(checkedAt = now)
+      case None =>
+        AccountVerificationResult(
+          accountId = accountId,
+          knownInBank = false,
+          ownerCustomerId = None,
+          firstSeenAt = None,
+          lastSeenAt = None,
+          transactionCount = 0,
+          totalVolume = BigDecimal(0),
+          linkedCustomers = Nil,
+          highRiskConnections = Nil,
+          suspiciousTxIds = Nil,
+          assessment = "Nowy / nieznany rachunek (Brak w dostępnej historii banku — brak historii nie dowodzi daty utworzenia rachunku)",
+          riskSignalCode = Some("UNKNOWN_ACCOUNT_HISTORY"),
+          checkedAt = now
+        )
+
   // --- 3. SA_GRAPH (ORACLE PROPERTY GRAPH) PROJECTION & ANALYSIS ---
 
-  def projectToGlobalPropertyGraph(tx: EnrichedTransaction): Unit =
-    val srcId   = if tx.direction == TransactionDirection.Outflow then tx.customerId else tx.counterpartyId
-    val tgtId   = if tx.direction == TransactionDirection.Outflow then tx.counterpartyId else tx.customerId
-    val edgeKey = s"$srcId->$tgtId"
-
-    val existingEdge = Option(graphEdges.get(edgeKey))
+  private def upsertEdge(
+      edgeId: String,
+      sourceVertexId: String,
+      targetVertexId: String,
+      relationshipType: String,
+      volumeDelta: BigDecimal,
+      txCountDelta: Int,
+      evidenceIdOpt: Option[String],
+      at: Instant,
+      validFrom: Option[Instant] = None,
+      validTo: Option[Instant] = None,
+      sourceSystem: String = "PAYMENT_RAILS",
+      lastEventId: Option[String] = None
+  ): GraphEdge =
+    val existingEdge = Option(graphEdges.get(edgeId))
     val updatedEdge = existingEdge match
       case Some(e) =>
         e.copy(
-          totalVolume = e.totalVolume + tx.amount,
-          txCount = e.txCount + 1,
-          evidenceTxIds = (tx.txId :: e.evidenceTxIds).distinct.take(25),
-          lastActiveAt = if tx.timestamp.isAfter(e.lastActiveAt) then tx.timestamp else e.lastActiveAt
+          totalVolume = e.totalVolume + volumeDelta,
+          txCount = e.txCount + txCountDelta,
+          evidenceTxIds = (evidenceIdOpt.toList ++ e.evidenceTxIds).distinct.take(25),
+          lastActiveAt = if at.isAfter(e.lastActiveAt) then at else e.lastActiveAt,
+          validFrom = e.validFrom.orElse(validFrom),
+          validTo = validTo.orElse(e.validTo),
+          sourceSystem = sourceSystem,
+          lastEventId = lastEventId.orElse(evidenceIdOpt).orElse(e.lastEventId)
         )
       case None =>
         GraphEdge(
-          edgeId = edgeKey,
-          sourceVertexId = srcId,
-          targetVertexId = tgtId,
-          relationshipType = if tx.restrictedTag.isDefined then "RESTRICTED_FLOW" else "FINANCIAL_TRANSFER",
-          totalVolume = tx.amount,
-          txCount = 1,
-          evidenceTxIds = List(tx.txId),
-          lastActiveAt = tx.timestamp
+          edgeId = edgeId,
+          sourceVertexId = sourceVertexId,
+          targetVertexId = targetVertexId,
+          relationshipType = relationshipType,
+          totalVolume = volumeDelta,
+          txCount = math.max(1, txCountDelta),
+          evidenceTxIds = evidenceIdOpt.toList,
+          lastActiveAt = at,
+          validFrom = validFrom.orElse(Some(at)),
+          validTo = validTo,
+          sourceSystem = sourceSystem,
+          lastEventId = lastEventId.orElse(evidenceIdOpt)
         )
-    graphEdges.put(edgeKey, updatedEdge)
-
-    val customerRisk = tx.restrictedTag.map(_.level.baseRiskWeight * 0.5).getOrElse(0.0)
-    upsertVertex(
-      vertexId = tx.customerId,
-      vertexType = "BANK_CUSTOMER",
-      intrinsicRisk = customerRisk,
-      at = tx.timestamp
-    )
-
-    val cpType =
-      if tx.restrictedTag.isDefined then "RESTRICTED_ENTITY"
-      else if tx.counterpartyIsBankClient then "BANK_CUSTOMER"
-      else "EXTERNAL_ENTITY"
-    val cpRisk = tx.restrictedTag.map(_.level.baseRiskWeight).getOrElse(
-      if tx.category.isHighRiskCategory then 0.65 else 0.0
-    )
-    upsertVertex(
-      vertexId = tx.counterpartyId,
-      vertexType = cpType,
-      intrinsicRisk = cpRisk,
-      at = tx.timestamp
-    )
+    graphEdges.put(edgeId, updatedEdge)
 
     withJdbcConnection { conn =>
       val sql =
@@ -692,6 +987,125 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
         ps.setString(12, evStr)
         ps.setTimestamp(13, ts)
         ps.executeUpdate()
+      }
+    }
+    updatedEdge
+
+  def projectToGlobalPropertyGraph(tx: EnrichedTransaction): Unit =
+    val isOwnTransfer = tx.isOwnAccountTransfer || tx.category == TransactionCategory.InternalOwnAccountTransfer || tx.customerId == tx.counterpartyId
+    val srcId   = if tx.direction == TransactionDirection.Outflow then tx.customerId else tx.counterpartyId
+    val tgtId   = if tx.direction == TransactionDirection.Outflow then tx.counterpartyId else tx.customerId
+    val edgeKey = if isOwnTransfer then s"OWN:$srcId->$tgtId" else s"$srcId->$tgtId"
+    val relType =
+      if isOwnTransfer then "OWN_ACCOUNT_TRANSFER"
+      else if tx.restrictedTag.isDefined then "RESTRICTED_FLOW"
+      else "FINANCIAL_TRANSFER"
+
+    upsertEdge(
+      edgeId = edgeKey,
+      sourceVertexId = srcId,
+      targetVertexId = tgtId,
+      relationshipType = relType,
+      volumeDelta = tx.amount,
+      txCountDelta = 1,
+      evidenceIdOpt = Some(tx.txId),
+      at = tx.timestamp,
+      validFrom = Some(tx.timestamp),
+      sourceSystem = "PAYMENT_RAILS",
+      lastEventId = Some(tx.txId)
+    )
+
+    val customerRisk = tx.restrictedTag.map(_.level.baseRiskWeight * 0.5).getOrElse(0.0)
+    upsertVertex(
+      vertexId = tx.customerId,
+      vertexType = "BANK_CUSTOMER",
+      intrinsicRisk = customerRisk,
+      at = tx.timestamp
+    )
+
+    val cpType =
+      if tx.restrictedTag.isDefined then "RESTRICTED_ENTITY"
+      else if tx.counterpartyIsBankClient || isOwnTransfer then "BANK_CUSTOMER"
+      else "EXTERNAL_ENTITY"
+    val cpRisk = tx.restrictedTag.map(_.level.baseRiskWeight).getOrElse(
+      if tx.category.isHighRiskCategory then 0.65 else 0.0
+    )
+    upsertVertex(
+      vertexId = tx.counterpartyId,
+      vertexType = cpType,
+      intrinsicRisk = cpRisk,
+      at = tx.timestamp
+    )
+
+    // Section 3.3 & Section 4: Project Account-Level Topology (Customer -> Account -> Transaction -> Account -> Customer)
+    val highRiskEntityOpt = tx.restrictedTag.map(_.entityId).orElse(Option.when(tx.category.isHighRiskCategory)(tx.counterpartyId))
+    tx.fromAccountId.filter(_.nonEmpty).foreach { fromAcc =>
+      val fromOwner = if tx.direction == TransactionDirection.Outflow then tx.customerId else tx.counterpartyId
+      upsertVertex(fromAcc, "CUSTOMER_ACCOUNT", customerRisk * 0.5, tx.timestamp)
+      upsertEdge(
+        edgeId = s"OWNS:$fromOwner->$fromAcc",
+        sourceVertexId = fromOwner,
+        targetVertexId = fromAcc,
+        relationshipType = "CUSTOMER_OWNS_ACCOUNT",
+        volumeDelta = BigDecimal(0),
+        txCountDelta = 1,
+        evidenceIdOpt = Some(tx.txId),
+        at = tx.timestamp
+      )
+      recordAccountObservation(
+        accountId = fromAcc,
+        ownerCustomerIdOpt = Some(fromOwner),
+        linkedCustomerOpt = Some(tgtId),
+        txIdOpt = Some(tx.txId),
+        amount = tx.amount,
+        highRiskEntityOpt = highRiskEntityOpt,
+        observedAt = tx.timestamp
+      )
+    }
+
+    tx.toAccountId.filter(_.nonEmpty).foreach { toAcc =>
+      val toOwnerOpt =
+        if isOwnTransfer then Some(tx.customerId)
+        else if tx.direction == TransactionDirection.Inflow then Some(tx.customerId)
+        else if tx.counterpartyIsBankClient then Some(tx.counterpartyId)
+        else None
+
+      upsertVertex(toAcc, "CUSTOMER_ACCOUNT", cpRisk, tx.timestamp)
+      toOwnerOpt.foreach { toOwner =>
+        upsertEdge(
+          edgeId = s"OWNS:$toOwner->$toAcc",
+          sourceVertexId = toOwner,
+          targetVertexId = toAcc,
+          relationshipType = "CUSTOMER_OWNS_ACCOUNT",
+          volumeDelta = BigDecimal(0),
+          txCountDelta = 1,
+          evidenceIdOpt = Some(tx.txId),
+          at = tx.timestamp
+        )
+      }
+      recordAccountObservation(
+        accountId = toAcc,
+        ownerCustomerIdOpt = toOwnerOpt,
+        linkedCustomerOpt = Some(srcId),
+        txIdOpt = Some(tx.txId),
+        amount = tx.amount,
+        highRiskEntityOpt = highRiskEntityOpt,
+        observedAt = tx.timestamp
+      )
+
+      tx.fromAccountId.filter(_.nonEmpty).foreach { fromAcc =>
+        val accEdgeType = if isOwnTransfer then "OWN_ACCOUNT_TRANSFER" else "FINANCIAL_TRANSFER"
+        upsertEdge(
+          edgeId = s"ACC_FLOW:$fromAcc->$toAcc",
+          sourceVertexId = fromAcc,
+          targetVertexId = toAcc,
+          relationshipType = accEdgeType,
+          volumeDelta = tx.amount,
+          txCountDelta = 1,
+          evidenceIdOpt = Some(tx.txId),
+          at = tx.timestamp,
+          lastEventId = Some(tx.txId)
+        )
       }
     }
 
@@ -825,9 +1239,15 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
 
     val allEdges    = graphEdges.values().asScala.toList
     val allVertices = graphVertices.asScala.toMap
+    val transferEdges = allEdges.filter(e =>
+      (e.relationshipType == "FINANCIAL_TRANSFER" || e.relationshipType == "RESTRICTED_FLOW") &&
+      !e.edgeId.startsWith("ACC_FLOW:") &&
+      e.sourceVertexId != e.targetVertexId
+    )
 
-    val byCounterparty: Map[String, List[GraphEdge]] = allEdges.groupBy(_.targetVertexId)
+    val byCounterparty: Map[String, List[GraphEdge]] = transferEdges.groupBy(_.targetVertexId)
 
+    // 1. Existing Shared High-Risk Counterparty & High-Degree Hub detector
     val inMemPatterns = byCounterparty.toList.flatMap { case (counterpartyId, incomingEdges) =>
       val distinctCustomers = incomingEdges
         .map(_.sourceVertexId)
@@ -862,9 +1282,278 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
       else Nil
     }
 
-    val combined = (pgqDetected ++ inMemPatterns).distinctBy(p => (p.patternId, p.affectedCustomerId))
+    // 2. Employee -> Phone Number -> Customer serviced by that employee (Doc/NowePotrzeby.md Section 2)
+    val empPhoneEdges  = allEdges.filter(_.relationshipType == "EMPLOYEE_HAS_PHONE")
+    val custPhoneEdges = allEdges.filter(e => e.relationshipType == "CUSTOMER_HAS_PHONE" && e.validTo.isEmpty)
+    val empServEdges   = allEdges.filter(_.relationshipType == "EMPLOYEE_SERVICES_CUSTOMER")
+
+    val employeeCustomerPatterns: List[NetworkRiskPatternDetected] =
+      for
+        empEdge  <- empPhoneEdges
+        custEdge <- custPhoneEdges if custEdge.targetVertexId == empEdge.targetVertexId
+      yield
+        val empId      = empEdge.sourceVertexId
+        val custId     = custEdge.sourceVertexId
+        val phoneVert  = empEdge.targetVertexId
+        val isServiced = empServEdges.exists(s => s.sourceVertexId == empId && s.targetVertexId == custId)
+        val score      = if isServiced then 0.68 else 0.50
+        NetworkRiskPatternDetected(
+          patternId = s"PAT-EMP-PHONE-${empId.replaceAll("[^A-Za-z0-9]", "")}-${custId.replaceAll("[^A-Za-z0-9]", "")}",
+          patternType = NetworkRiskPatternType.EmployeeCustomerPhoneMatch,
+          affectedCustomerId = custId,
+          sharedEntityId = phoneVert,
+          linkedCustomers = List(empId, custId),
+          riskScore = score,
+          reasonCode = "EMPLOYEE_CUSTOMER_PHONE_MATCH",
+          description =
+            s"Wykryto powiązanie w grafie SA_GRAPH: Pracownik '$empId' -> $phoneVert -> Klient '$custId' (obsługiwany przez tego pracownika: ${if isServiced then "TAK" else "NIE"})",
+          evidenceIds = (empEdge.evidenceTxIds ++ custEdge.evidenceTxIds).distinct,
+          detectedAt = now
+        )
+
+    // 3. Mule Detector A: Rapid Pass-Through (Doc/NowePotrzeby.md Section 3.2: Klient A -> Klient B (Słup) -> Klient C)
+    val incomingByNode = transferEdges.groupBy(_.targetVertexId)
+    val outgoingByNode = transferEdges.groupBy(_.sourceVertexId)
+
+    val rapidPassThroughPatterns: List[NetworkRiskPatternDetected] =
+      incomingByNode.toList.flatMap { case (intermediaryId, inEdges) =>
+        val outEdges = outgoingByNode.getOrElse(intermediaryId, Nil).filter(_.targetVertexId != intermediaryId)
+        val totalIn  = inEdges.map(_.totalVolume).sum
+        val totalOut = outEdges.map(_.totalVolume).sum
+        if totalIn >= BigDecimal("5000.00") && outEdges.nonEmpty then
+          val passThroughRatio = (totalOut / totalIn).setScale(4, BigDecimal.RoundingMode.HALF_UP)
+          if passThroughRatio >= BigDecimal("0.75") && passThroughRatio <= BigDecimal("1.05") then
+            val senders   = inEdges.map(_.sourceVertexId).distinct
+            val receivers = outEdges.map(_.targetVertexId).filterNot(senders.contains).distinct
+            if receivers.nonEmpty then
+              val evidence = (inEdges.flatMap(_.evidenceTxIds) ++ outEdges.flatMap(_.evidenceTxIds)).distinct
+              val chainParticipants = (senders ++ List(intermediaryId) ++ receivers).distinct
+              val affectedBankCustomers = chainParticipants.filter(id => allVertices.get(id).exists(_.vertexType == "BANK_CUSTOMER"))
+              affectedBankCustomers.map { affectedCust =>
+                NetworkRiskPatternDetected(
+                  patternId = s"PAT-MULE-PASSTHROUGH-${intermediaryId.replaceAll("[^A-Za-z0-9]", "")}-${affectedCust.replaceAll("[^A-Za-z0-9]", "")}",
+                  patternType = NetworkRiskPatternType.RapidPassThrough,
+                  affectedCustomerId = affectedCust,
+                  sharedEntityId = intermediaryId,
+                  linkedCustomers = chainParticipants,
+                  riskScore = 0.85,
+                  reasonCode = "SUSPECTED_MULE_ACCOUNT",
+                  description =
+                    s"Rapid Pass-Through (Konto Słup '$intermediaryId'): otrzymano $totalIn od [${senders.mkString(", ")}] i natychmiast przekazano $totalOut (${(passThroughRatio * 100).setScale(1, BigDecimal.RoundingMode.HALF_UP)}%) dalej do [${receivers.mkString(", ")}]",
+                  evidenceIds = evidence,
+                  detectedAt = now
+                )
+              }
+            else Nil
+          else Nil
+        else Nil
+      }
+
+    // 4. Mule Detector B: Fan-In / Fan-Out (Doc/NowePotrzeby.md Section 3.2)
+    val fanInFanOutPatterns: List[NetworkRiskPatternDetected] =
+      incomingByNode.toList.flatMap { case (hubId, inEdges) =>
+        val outEdges = outgoingByNode.getOrElse(hubId, Nil)
+        val distinctSenders   = inEdges.map(_.sourceVertexId).distinct
+        val distinctReceivers = outEdges.map(_.targetVertexId).distinct
+        if (distinctSenders.size >= 2 && distinctReceivers.nonEmpty) || (distinctSenders.nonEmpty && distinctReceivers.size >= 2) then
+          val totalVol = inEdges.map(_.totalVolume).sum + outEdges.map(_.totalVolume).sum
+          if totalVol >= BigDecimal("3000.00") then
+            val participants = (distinctSenders ++ List(hubId) ++ distinctReceivers).distinct
+            val evidence     = (inEdges.flatMap(_.evidenceTxIds) ++ outEdges.flatMap(_.evidenceTxIds)).distinct
+            participants
+              .filter(id => allVertices.get(id).exists(_.vertexType == "BANK_CUSTOMER"))
+              .map { affectedCust =>
+                NetworkRiskPatternDetected(
+                  patternId = s"PAT-MULE-FAN-${hubId.replaceAll("[^A-Za-z0-9]", "")}-${affectedCust.replaceAll("[^A-Za-z0-9]", "")}",
+                  patternType = NetworkRiskPatternType.FanInFanOut,
+                  affectedCustomerId = affectedCust,
+                  sharedEntityId = hubId,
+                  linkedCustomers = participants,
+                  riskScore = 0.78,
+                  reasonCode = "SUSPECTED_MULE_ACCOUNT",
+                  description =
+                    s"Fan-In / Fan-Out wokół '$hubId' (nadawcy: ${distinctSenders.size} [${distinctSenders.mkString(", ")}] -> '$hubId' -> odbiorcy: ${distinctReceivers.size} [${distinctReceivers.mkString(", ")}])",
+                  evidenceIds = evidence,
+                  detectedAt = now
+                )
+              }
+          else Nil
+        else Nil
+      }
+
+    // 5. Mule Detector C & D: Multi-Hop Money Movement (A -> B -> C -> D) & Circular Transfers (A -> B -> C -> A or A -> B -> A)
+    val multiHopAndCircularPatterns = ListBuffer.empty[NetworkRiskPatternDetected]
+    for
+      e1 <- transferEdges
+      a  = e1.sourceVertexId
+      b  = e1.targetVertexId if a != b
+      e2 <- outgoingByNode.getOrElse(b, Nil)
+      c  = e2.targetVertexId if c != b
+    do
+      if c == a then
+        // 2-cycle Circular Transfer: A -> B -> A
+        val chain    = List(a, b, a)
+        val evidence = (e1.evidenceTxIds ++ e2.evidenceTxIds).distinct
+        List(a, b).filter(id => allVertices.get(id).exists(_.vertexType == "BANK_CUSTOMER")).foreach { affected =>
+          multiHopAndCircularPatterns += NetworkRiskPatternDetected(
+            patternId = s"PAT-CIRCULAR-${a.replaceAll("[^A-Za-z0-9]", "")}-${b.replaceAll("[^A-Za-z0-9]", "")}-${affected.replaceAll("[^A-Za-z0-9]", "")}",
+            patternType = NetworkRiskPatternType.CircularTransfers,
+            affectedCustomerId = affected,
+            sharedEntityId = b,
+            linkedCustomers = chain.distinct,
+            riskScore = 0.80,
+            reasonCode = "SUSPECTED_MULE_ACCOUNT",
+            description = s"Circular Transfers (Karuzela środków): wykryto zamknięty obieg ${chain.mkString(" -> ")}",
+            evidenceIds = evidence,
+            detectedAt = now
+          )
+        }
+      else
+        for
+          e3 <- outgoingByNode.getOrElse(c, Nil)
+          d  = e3.targetVertexId if d != c && d != b
+        do
+          val evidence = (e1.evidenceTxIds ++ e2.evidenceTxIds ++ e3.evidenceTxIds).distinct
+          if d == a then
+            // 3-cycle Circular Transfer: A -> B -> C -> A
+            val chain = List(a, b, c, a)
+            List(a, b, c).filter(id => allVertices.get(id).exists(_.vertexType == "BANK_CUSTOMER")).foreach { affected =>
+              multiHopAndCircularPatterns += NetworkRiskPatternDetected(
+                patternId = s"PAT-CIRCULAR3-${a.replaceAll("[^A-Za-z0-9]", "")}-${b.replaceAll("[^A-Za-z0-9]", "")}-${affected.replaceAll("[^A-Za-z0-9]", "")}",
+                patternType = NetworkRiskPatternType.CircularTransfers,
+                affectedCustomerId = affected,
+                sharedEntityId = b,
+                linkedCustomers = List(a, b, c),
+                riskScore = 0.86,
+                reasonCode = "SUSPECTED_MULE_ACCOUNT",
+                description = s"Circular Transfers (3-hop): środki wróciły do uczestnika początkowego (${chain.mkString(" -> ")})",
+                evidenceIds = evidence,
+                detectedAt = now
+              )
+            }
+          else
+            // 3-hop Multi-Hop Money Movement chain: A -> B -> C -> D (Doc/NowePotrzeby.md Section 3.2)
+            val chain = List(a, b, c, d)
+            chain.filter(id => allVertices.get(id).exists(_.vertexType == "BANK_CUSTOMER")).foreach { affected =>
+              multiHopAndCircularPatterns += NetworkRiskPatternDetected(
+                patternId = s"PAT-MULTIHOP-${b.replaceAll("[^A-Za-z0-9]", "")}-${c.replaceAll("[^A-Za-z0-9]", "")}-${affected.replaceAll("[^A-Za-z0-9]", "")}",
+                patternType = NetworkRiskPatternType.MultiHopMoneyMovement,
+                affectedCustomerId = affected,
+                sharedEntityId = b,
+                linkedCustomers = chain,
+                riskScore = 0.88,
+                reasonCode = "SUSPECTED_MULE_ACCOUNT",
+                description =
+                  s"Multi-Hop Money Movement: łańcuch transferów ${chain.mkString(" -> ")} (wypływ z '$a' przez pośredników '$b' i '$c' do '$d')",
+                evidenceIds = evidence,
+                detectedAt = now
+              )
+            }
+
+    val combined = (
+      pgqDetected ++
+      inMemPatterns ++
+      employeeCustomerPatterns ++
+      rapidPassThroughPatterns ++
+      fanInFanOutPatterns ++
+      multiHopAndCircularPatterns.toList
+    ).distinctBy(p => (p.patternId, p.affectedCustomerId))
+
     combined.foreach(recordRiskIntelligenceEvent)
     combined
+
+  /**
+   * Interactive Graph Investigation Workbench query (`Doc/NowePotrzeby.md` Section 5):
+   * Allows an analyst to start from any entity (`rootEntityId`), expand relationships up to `depth` hops,
+   * filter by relationship type, and inspect shared phones, shared accounts, shared counterparties, and risk provenance.
+   */
+  def investigateGraph(
+      rootEntityId: String,
+      depth: Int = 2,
+      relationshipTypeFilter: Option[String] = None,
+      now: Instant = Instant.now()
+  ): GraphInvestigationResult =
+    val boundedDepth = math.max(1, math.min(4, depth))
+    val allEdges     = graphEdges.values().asScala.toList
+    val allVertices  = graphVertices.asScala.toMap
+
+    val filteredAllEdges = relationshipTypeFilter.map(_.trim).filter(_.nonEmpty) match
+      case Some(relFilter) => allEdges.filter(_.relationshipType.equalsIgnoreCase(relFilter))
+      case None            => allEdges
+
+    var visitedVertices = Set(rootEntityId)
+    var collectedEdges  = Map.empty[String, GraphEdge]
+
+    for _ <- 1 to boundedDepth do
+      val hopEdges = filteredAllEdges.filter(e =>
+        visitedVertices.contains(e.sourceVertexId) || visitedVertices.contains(e.targetVertexId)
+      )
+      hopEdges.foreach { e =>
+        collectedEdges = collectedEdges.updated(e.edgeId, e)
+        visitedVertices = visitedVertices + e.sourceVertexId + e.targetVertexId
+      }
+
+    val subVertices = visitedVertices.toList.flatMap(vid => allVertices.get(vid)).sortBy(_.vertexId)
+    val subEdges    = collectedEdges.values.toList.sortBy(_.edgeId)
+
+    val sharedPhones = subVertices
+      .filter(_.vertexType == "PHONE_NUMBER")
+      .filter { pv =>
+        val connectedOwners = allEdges
+          .filter(e => e.targetVertexId == pv.vertexId && (e.relationshipType == "CUSTOMER_HAS_PHONE" || e.relationshipType == "EMPLOYEE_HAS_PHONE"))
+          .map(_.sourceVertexId)
+          .distinct
+        connectedOwners.size >= 2
+      }
+      .map(_.vertexId)
+
+    val sharedAccounts = subVertices
+      .filter(_.vertexType == "CUSTOMER_ACCOUNT")
+      .filter { av =>
+        val connected = allEdges
+          .filter(e => e.sourceVertexId == av.vertexId || e.targetVertexId == av.vertexId)
+          .flatMap(e => List(e.sourceVertexId, e.targetVertexId))
+          .filter(_ != av.vertexId)
+          .distinct
+        connected.size >= 2
+      }
+      .map(_.vertexId)
+
+    val sharedCounterparties = subVertices
+      .filter(v => v.vertexType == "EXTERNAL_ENTITY" || v.vertexType == "RESTRICTED_ENTITY")
+      .filter { cp =>
+        val connectedCusts = allEdges
+          .filter(e => e.targetVertexId == cp.vertexId || e.sourceVertexId == cp.vertexId)
+          .flatMap(e => List(e.sourceVertexId, e.targetVertexId))
+          .filter(id => allVertices.get(id).exists(_.vertexType == "BANK_CUSTOMER"))
+          .distinct
+        connectedCusts.size >= 2
+      }
+      .map(_.vertexId)
+
+    val empLinks = contactChangeHistory.asScala.toList.filter(c =>
+      visitedVertices.contains(c.customerId) || c.matchedEmployeeId.exists(visitedVertices.contains)
+    )
+
+    val relPatterns = riskIntelEvents.asScala.toList.filter(p =>
+      visitedVertices.contains(p.affectedCustomerId) ||
+      visitedVertices.contains(p.sharedEntityId) ||
+      p.linkedCustomers.exists(visitedVertices.contains)
+    )
+
+    GraphInvestigationResult(
+      rootEntityId = rootEntityId,
+      depth = boundedDepth,
+      relationshipTypeFilter = relationshipTypeFilter,
+      vertices = subVertices,
+      edges = subEdges,
+      sharedPhones = sharedPhones,
+      sharedAccounts = sharedAccounts,
+      sharedCounterparties = sharedCounterparties,
+      employeeCustomerLinks = empLinks,
+      relatedPatterns = relPatterns,
+      queriedAt = now
+    )
 
   // --- 4. SA_INTELLIGENCE OPERATIONS ---
 
@@ -959,6 +1648,34 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
       }
     }
 
+  def recordTransactionAuthorizationAudit(response: TransactionAuthorizationResponse): Unit =
+    txAuthorizationAuditLog.addFirst(response)
+    while txAuthorizationAuditLog.size() > 200 do txAuthorizationAuditLog.removeLast()
+
+    withJdbcConnection { conn =>
+      val reasons = response.principalReasons.map(_.code).mkString(",")
+      val sql =
+        """MERGE INTO SA_DECISIONS.TRANSACTION_AUTHORIZATION_LOG t
+          |USING (SELECT ? AS tid FROM dual) s ON (t.TRANSFER_ID = s.tid)
+          |WHEN NOT MATCHED THEN INSERT
+          |  (TRANSFER_ID, CUSTOMER_ID, TO_ACCOUNT_ID, TO_COUNTERPARTY_ID, AMOUNT, DECISION_STATUS, RISK_SCORE, REASON_CODES, RAIL_DIRECTIVE, EVALUATED_AT)
+          |VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""".stripMargin
+      Using.resource(conn.prepareStatement(sql)) { ps =>
+        ps.setString(1, response.transferId)
+        ps.setString(2, response.transferId)
+        ps.setString(3, response.customerId)
+        ps.setString(4, response.toAccountId)
+        ps.setString(5, response.toCounterpartyId)
+        ps.setBigDecimal(6, response.amount.bigDecimal)
+        ps.setString(7, response.decision.toString)
+        ps.setInt(8, response.riskScore)
+        ps.setString(9, if reasons.isEmpty then "NONE" else reasons)
+        ps.setString(10, response.paymentRailDirective)
+        ps.setTimestamp(11, Timestamp.from(response.evaluatedAt))
+        ps.executeUpdate()
+      }
+    }
+
   // --- 6. SA_GOVERNANCE OPERATIONS ---
 
   def registerGovernancePolicy(policy: GovernancePolicyRow): Unit =
@@ -1005,6 +1722,21 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
   def getVerifiedDocumentFacts: List[VerifiedDocumentFact] =
     verifiedDocFacts.values().asScala.toList
 
+  def getCustomerAccounts: List[CustomerAccount] =
+    customerAccounts.values().asScala.toList
+
+  def getAccountHistoryRegistry: List[AccountVerificationResult] =
+    accountHistoryMap.values().asScala.toList
+
+  def getAccountFirstSeenRegistry: List[AccountFirstSeen] =
+    accountFirstSeenMap.values().asScala.toList
+
+  def getEmployees: List[EmployeeProfile] =
+    employeeRegistry.values().asScala.toList
+
+  def getContactChangeHistory: List[NormalizedCustomerContactChange] =
+    contactChangeHistory.asScala.toList
+
   def getGraphVertices: List[GraphVertex] =
     graphVertices.values().asScala.toList
 
@@ -1023,15 +1755,18 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
   def getProjectionAuditLog: List[SituationProjection] =
     projectionAuditLog.asScala.toList
 
+  def getTransactionAuthorizationAuditLog: List[TransactionAuthorizationResponse] =
+    txAuthorizationAuditLog.asScala.toList
+
   def getGovernancePolicies: List[GovernancePolicyRow] =
     governancePolicies.values().asScala.toList
 
   def getSchemaRecordCounts: Map[String, Int] = Map(
     "SA_PERSISTENCE"  -> (persistenceJournal.size() + persistenceSnapshots.size() + persistenceOutbox.size()),
-    "SA_FACTS"        -> (financialTxFacts.size() + verifiedDocFacts.size() + debtObligationFacts.size()),
+    "SA_FACTS"        -> (financialTxFacts.size() + verifiedDocFacts.size() + debtObligationFacts.size() + accountHistoryMap.size() + contactChangeHistory.size()),
     "SA_GRAPH"        -> (graphVertices.size() + graphEdges.size()),
     "SA_INTELLIGENCE" -> (riskIntelEvents.size() + portfolioSnapshots.size()),
-    "SA_DECISIONS"    -> (decisionAuditLog.size() + projectionAuditLog.size()),
+    "SA_DECISIONS"    -> (decisionAuditLog.size() + projectionAuditLog.size() + txAuthorizationAuditLog.size()),
     "SA_GOVERNANCE"   -> governancePolicies.size()
   )
 
@@ -1043,9 +1778,15 @@ class OracleExadataRepository(val jdbcConfig: OracleJdbcConfig = OracleJdbcConfi
     financialTxFacts.clear()
     verifiedDocFacts.clear()
     debtObligationFacts.clear()
+    customerAccounts.clear()
+    accountFirstSeenMap.clear()
+    accountHistoryMap.clear()
+    employeeRegistry.clear()
+    contactChangeHistory.clear()
     graphVertices.clear()
     graphEdges.clear()
     riskIntelEvents.clear()
     portfolioSnapshots.clear()
     decisionAuditLog.clear()
     projectionAuditLog.clear()
+    txAuthorizationAuditLog.clear()

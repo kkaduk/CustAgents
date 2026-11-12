@@ -27,26 +27,33 @@ class RuleBasedExternalCategorizer extends ExternalTransactionCategorizer:
   override val categorizerName: String = "ExternalCategorizerModule-v2.1"
 
   override def categorize(raw: RawTransaction): TransactionCategory =
-    val cpUpper   = raw.toCounterpartyId.toUpperCase
-    val descUpper = raw.merchantDescription.getOrElse("").toUpperCase
-    val combined  = s"$cpUpper $descUpper"
-
-    if combined.contains("CASINO") || combined.contains("BET") || combined.contains("LOTTO") || combined.contains("GAMBL") then
-      TransactionCategory.Gambling
-    else if combined.contains("CRYPTO") || combined.contains("BINANCE") || combined.contains("COIN") || combined.contains("DARKNET") then
-      TransactionCategory.CryptoExchange
-    else if combined.contains("SHADOW") || combined.contains("SANCTION") || combined.contains("UNLICENSED") || combined.contains("OFFSHORE") then
-      TransactionCategory.HighRiskTransfer
-    else if combined.contains("EMPLOYER") || combined.contains("PAYROLL") || combined.contains("SALARY") then
-      TransactionCategory.Salary
-    else if combined.contains("HOUSING") || combined.contains("LANDLORD") || combined.contains("RENT") || combined.contains("MORTGAGE") then
-      TransactionCategory.Housing
-    else if combined.contains("UTILITY") || combined.contains("ENERGY") || combined.contains("ELECTRIC") || combined.contains("WATER") then
-      TransactionCategory.Utilities
-    else if combined.contains("LOAN-REPAY") || combined.contains("CREDIT-BANK") then
-      TransactionCategory.LoanRepayment
+    if raw.fromCustomerId == raw.toCounterpartyId ||
+       (raw.fromAccountId.isDefined && raw.fromAccountId == raw.toAccountId)
+    then
+      TransactionCategory.InternalOwnAccountTransfer
     else
-      raw.category
+      val cpUpper   = raw.toCounterpartyId.toUpperCase
+      val descUpper = raw.merchantDescription.getOrElse("").toUpperCase
+      val combined  = s"$cpUpper $descUpper"
+
+      if combined.contains("OWN_ACCOUNT") || combined.contains("PRZELEW WLASNY") || combined.contains("INTERNAL_OWN") then
+        TransactionCategory.InternalOwnAccountTransfer
+      else if combined.contains("CASINO") || combined.contains("BET") || combined.contains("LOTTO") || combined.contains("GAMBL") then
+        TransactionCategory.Gambling
+      else if combined.contains("CRYPTO") || combined.contains("BINANCE") || combined.contains("COIN") || combined.contains("DARKNET") then
+        TransactionCategory.CryptoExchange
+      else if combined.contains("SHADOW") || combined.contains("SANCTION") || combined.contains("UNLICENSED") || combined.contains("OFFSHORE") then
+        TransactionCategory.HighRiskTransfer
+      else if combined.contains("EMPLOYER") || combined.contains("PAYROLL") || combined.contains("SALARY") then
+        TransactionCategory.Salary
+      else if combined.contains("HOUSING") || combined.contains("LANDLORD") || combined.contains("RENT") || combined.contains("MORTGAGE") then
+        TransactionCategory.Housing
+      else if combined.contains("UTILITY") || combined.contains("ENERGY") || combined.contains("ELECTRIC") || combined.contains("WATER") then
+        TransactionCategory.Utilities
+      else if combined.contains("LOAN-REPAY") || combined.contains("CREDIT-BANK") then
+        TransactionCategory.LoanRepayment
+      else
+        raw.category
 
 /**
  * Bilateral transaction perspective created during Flink enrichment.
@@ -63,8 +70,20 @@ final case class CustomerDirectedTransaction(
     category: TransactionCategory,
     resultsInOverdraft: Boolean,
     timestamp: java.time.Instant,
-    categorizerSource: String = "ExternalCategorizerModule-v2.1"
+    categorizerSource: String = "ExternalCategorizerModule-v2.1",
+    fromAccountId: Option[String] = None,
+    toAccountId: Option[String] = None,
+    isOwnAccountTransfer: Boolean = false
 ) extends Serializable
+
+/**
+ * Flink operator normalizing customer contact/phone number changes arriving on Kafka (`Doc/NowePotrzeby.md` Section 2).
+ */
+class ContactPhoneNormalizerMapFunction(
+    employees: List[EmployeeProfile] = Nil
+) extends MapFunction[RawCustomerContactChange, NormalizedCustomerContactChange] with Serializable:
+  override def map(raw: RawCustomerContactChange): NormalizedCustomerContactChange =
+    EnrichmentLogic.normalizeContactChange(raw, employees)
 
 /**
  * Stage 1 (Section 8): Flink `Validation` operator filtering out malformed or non-positive transactions.
@@ -178,21 +197,31 @@ object EnrichmentLogic:
       raw: RawTransaction,
       categorizerSource: String = DefaultCategorizer.categorizerName
   ): List[CustomerDirectedTransaction] =
+    val isOwnTransfer =
+      raw.fromCustomerId == raw.toCounterpartyId ||
+        raw.category == TransactionCategory.InternalOwnAccountTransfer
+
     val outflow = CustomerDirectedTransaction(
       txId = raw.txId,
       customerId = raw.fromCustomerId,
       counterpartyId = raw.toCounterpartyId,
-      counterpartyIsBankClient = raw.counterpartyIsBankClient,
+      counterpartyIsBankClient = raw.counterpartyIsBankClient || isOwnTransfer,
       direction = TransactionDirection.Outflow,
       amount = raw.amount,
       currency = raw.currency,
-      category = raw.category,
+      category = if isOwnTransfer then TransactionCategory.InternalOwnAccountTransfer else raw.category,
       resultsInOverdraft = raw.resultsInOverdraft,
       timestamp = raw.timestamp,
-      categorizerSource = categorizerSource
+      categorizerSource = categorizerSource,
+      fromAccountId = raw.fromAccountId,
+      toAccountId = raw.toAccountId,
+      isOwnAccountTransfer = isOwnTransfer
     )
 
-    if raw.counterpartyIsBankClient then
+    if isOwnTransfer then
+      // Section 3.3: Transfers between own accounts of the same customer are recorded once on the customer's shard
+      List(outflow)
+    else if raw.counterpartyIsBankClient then
       val inflow = CustomerDirectedTransaction(
         txId = raw.txId,
         customerId = raw.toCounterpartyId,
@@ -204,7 +233,10 @@ object EnrichmentLogic:
         category = raw.category,
         resultsInOverdraft = false,
         timestamp = raw.timestamp,
-        categorizerSource = categorizerSource
+        categorizerSource = categorizerSource,
+        fromAccountId = raw.fromAccountId,
+        toAccountId = raw.toAccountId,
+        isOwnAccountTransfer = false
       )
       List(outflow, inflow)
     else List(outflow)
@@ -225,7 +257,47 @@ object EnrichmentLogic:
       resultsInOverdraft = tx.resultsInOverdraft,
       restrictedTag = restrictedTag,
       timestamp = tx.timestamp,
-      categorizerSource = tx.categorizerSource
+      categorizerSource = tx.categorizerSource,
+      fromAccountId = tx.fromAccountId,
+      toAccountId = tx.toAccountId,
+      isOwnAccountTransfer = tx.isOwnAccountTransfer
+    )
+
+  /**
+   * Normalizes phone numbers in the Flink enrichment stream (`Doc/NowePotrzeby.md` Section 2):
+   * e.g. "+48 500-100-200" or "500 100 200" -> "500100200".
+   */
+  def normalizePhoneNumber(rawPhone: String): String =
+    val digitsOnly = Option(rawPhone).getOrElse("").replaceAll("[^0-9]", "")
+    if digitsOnly.startsWith("0048") && digitsOnly.length > 4 then digitsOnly.substring(4)
+    else if digitsOnly.startsWith("48") && digitsOnly.length == 11 then digitsOnly.substring(2)
+    else digitsOnly
+
+  /**
+   * Normalizes a customer contact change event in Flink and checks for matching employee phone numbers
+   * (`Doc/NowePotrzeby.md` Section 2).
+   */
+  def normalizeContactChange(
+      raw: RawCustomerContactChange,
+      employees: Iterable[EmployeeProfile]
+  ): NormalizedCustomerContactChange =
+    val newNorm  = normalizePhoneNumber(raw.newPhoneRaw)
+    val prevNorm = raw.previousPhoneRaw.map(normalizePhoneNumber).filter(_.nonEmpty)
+
+    val matchedEmp = employees.find(emp => normalizePhoneNumber(emp.phoneNumberNormalized) == newNorm || normalizePhoneNumber(emp.phoneNumberRaw) == newNorm)
+    val servicesCustomer = matchedEmp.exists(_.servicedCustomerIds.contains(raw.customerId))
+
+    NormalizedCustomerContactChange(
+      eventId = raw.eventId,
+      customerId = raw.customerId,
+      previousPhoneNormalized = prevNorm,
+      newPhoneNormalized = newNorm,
+      sourceSystem = raw.sourceSystem,
+      changedByEmployeeId = raw.changedByEmployeeId,
+      matchedEmployeeId = matchedEmp.map(_.employeeId),
+      matchedEmployeeName = matchedEmp.map(_.fullName),
+      employeeServicesCustomer = servicesCustomer,
+      occurredAt = raw.occurredAt
     )
 
   def enrichBatchInMemory(

@@ -61,7 +61,9 @@ final case class RawTransactionIngestRequest(
     category: String,
     resultsInOverdraft: Boolean,
     timestamp: Option[Instant] = None,
-    merchantDescription: Option[String] = None
+    merchantDescription: Option[String] = None,
+    fromAccountId: Option[String] = None,
+    toAccountId: Option[String] = None
 ):
   def toDomain: RawTransaction =
     RawTransaction(
@@ -74,7 +76,96 @@ final case class RawTransactionIngestRequest(
       category = TransactionCategory.valueOf(category),
       resultsInOverdraft = resultsInOverdraft,
       timestamp = Option(timestamp).flatten.getOrElse(Instant.now()),
-      merchantDescription = Option(merchantDescription).flatten
+      merchantDescription = Option(merchantDescription).flatten,
+      fromAccountId = Option(fromAccountId).flatten,
+      toAccountId = Option(toAccountId).flatten
+    )
+
+// --- NEW BUSINESS NEEDS REQUEST DTOs (Doc/NowePotrzeby.md Sections 2, 3, 4, 5, 6) ---
+
+final case class EmployeeRegistrationRequest(
+    employeeId: String,
+    fullName: String,
+    role: String = "Relationship Manager",
+    branchId: String = "BRANCH-WARSAW-01",
+    phoneNumber: String,
+    servicedCustomerIds: List[String] = Nil
+):
+  def toDomain(now: Instant = Instant.now()): EmployeeProfile =
+    EmployeeProfile(
+      employeeId = employeeId,
+      fullName = fullName,
+      role = Option(role).getOrElse("Relationship Manager"),
+      branchId = Option(branchId).getOrElse("BRANCH-WARSAW-01"),
+      phoneNumberRaw = phoneNumber,
+      phoneNumberNormalized = phoneNumber,
+      servicedCustomerIds = Option(servicedCustomerIds).getOrElse(Nil),
+      registeredAt = now
+    )
+
+final case class CustomerAccountRegistrationRequest(
+    accountId: String,
+    customerId: String,
+    accountType: String = "CHECKING",
+    currency: String = "PLN"
+):
+  def toDomain(now: Instant = Instant.now()): CustomerAccount =
+    CustomerAccount(
+      accountId = accountId,
+      customerId = customerId,
+      accountType = Option(accountType).getOrElse("CHECKING"),
+      currency = Option(currency).getOrElse("PLN"),
+      openedAt = now
+    )
+
+final case class CustomerContactChangeRequest(
+    eventId: String,
+    customerId: String,
+    previousPhone: Option[String] = None,
+    newPhone: String,
+    sourceSystem: String = "CRM-CONTACT-REGISTRY",
+    changedByEmployeeId: Option[String] = None
+):
+  def toDomain(now: Instant = Instant.now()): RawCustomerContactChange =
+    RawCustomerContactChange(
+      eventId = eventId,
+      customerId = customerId,
+      previousPhoneRaw = Option(previousPhone).flatten,
+      newPhoneRaw = newPhone,
+      sourceSystem = Option(sourceSystem).getOrElse("CRM-CONTACT-REGISTRY"),
+      changedByEmployeeId = Option(changedByEmployeeId).flatten,
+      occurredAt = now
+    )
+
+final case class OnePlnAccountVerificationRequest(
+    customerId: String,
+    targetAccountId: String,
+    transferAmount: Option[BigDecimal] = None
+)
+
+final case class PreExecutionTransferRequest(
+    transferId: String,
+    customerId: String,
+    fromAccountId: Option[String] = None,
+    toAccountId: String,
+    toCounterpartyId: String,
+    amount: BigDecimal,
+    currency: String = "PLN",
+    title: String = "",
+    isVerificationOnePlnTransfer: Boolean = false
+):
+  def toDomain(now: Instant = Instant.now()): ProposedPaymentTransfer =
+    ProposedPaymentTransfer(
+      transferId = transferId,
+      customerId = customerId,
+      fromAccountId = Option(fromAccountId).flatten,
+      toAccountId = toAccountId,
+      toCounterpartyId = toCounterpartyId,
+      amount = amount,
+      currency = Option(currency).getOrElse("PLN"),
+      title = Option(title).getOrElse(""),
+      isVerificationOnePlnTransfer = isVerificationOnePlnTransfer,
+      requestedAt = now
     )
 
 // --- RESPONSE DTOs ---
@@ -225,6 +316,10 @@ final case class CustomerSituationSnapshotDto(
     netCashflow30d: BigDecimal,
     highRiskSpend30d: BigDecimal,
     overdraftCount30d: Int,
+    internalOwnTransferVolume30d: BigDecimal = BigDecimal(0),
+    ownedAccountIds: List[String] = Nil,
+    currentPhoneNumber: Option[String] = None,
+    servicedByEmployeeIds: List[String] = Nil,
     verifiedFacts: Map[String, String],
     connectedBankPeers: List[String],
     maxNetworkRiskScore: Double,
@@ -270,6 +365,10 @@ object CustomerSituationSnapshotDto:
       netCashflow30d = metrics30d.netCashflow,
       highRiskSpend30d = metrics30d.highRiskSpend,
       overdraftCount30d = metrics30d.overdraftCount,
+      internalOwnTransferVolume30d = metrics30d.internalOwnTransferVolume,
+      ownedAccountIds = state.ownedAccountIds.toList.sorted,
+      currentPhoneNumber = state.currentPhoneNumber,
+      servicedByEmployeeIds = state.servicedByEmployeeIds.toList.sorted,
       verifiedFacts = factsMap,
       connectedBankPeers = state.connectedBankPeers.map(_.counterpartyId),
       maxNetworkRiskScore = state.maxNetworkRiskScore,
@@ -330,7 +429,11 @@ final case class SystemOverviewDto(
     recentDecisions: List[LoanOriginationDecisionDto],
     registeredEventPlugins: List[String] = Nil,
     oracleSchemasStatus: Map[String, Int] = Map.empty,
-    globalPatternsDetected: List[NetworkRiskPatternDetected] = Nil
+    globalPatternsDetected: List[NetworkRiskPatternDetected] = Nil,
+    recentTransferAuthorizations: List[TransactionAuthorizationResponse] = Nil,
+    accountHistoryRegistry: List[AccountVerificationResult] = Nil,
+    contactChangeHistory: List[NormalizedCustomerContactChange] = Nil,
+    employees: List[EmployeeProfile] = Nil
 )
 
 final case class OracleExadataOverviewDto(
@@ -343,7 +446,11 @@ final case class OracleExadataOverviewDto(
     graphVertices: List[GraphVertex],
     graphEdges: List[GraphEdge],
     riskIntelligenceEvents: List[NetworkRiskPatternDetected],
-    governancePolicies: List[GovernancePolicyRow]
+    governancePolicies: List[GovernancePolicyRow],
+    accountHistoryRegistry: List[AccountVerificationResult] = Nil,
+    contactChangeHistory: List[NormalizedCustomerContactChange] = Nil,
+    employees: List[EmployeeProfile] = Nil,
+    transactionAuthorizations: List[TransactionAuthorizationResponse] = Nil
 )
 
 /**

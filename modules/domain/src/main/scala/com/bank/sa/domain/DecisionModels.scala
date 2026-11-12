@@ -85,3 +85,45 @@ final case class LoanDecisionResponse(
     auditTrail: ExplainableAuditTrail,
     evaluatedAt: Instant
 ) extends Serializable
+
+// =============================================================================
+// PRE-EXECUTION TRANSACTION RISK DECISION ENGINE MODELS (Doc/NowePotrzeby.md Section 6)
+// =============================================================================
+
+/**
+ * Operational payment authorization decision returned to the payment system before transfer execution:
+ * - `ALLOW`       — Transfer proceeds immediately
+ * - `REVIEW_HOLD` — Transfer is placed on hold for analyst/customer verification
+ * - `BLOCK`       — Transfer is blocked prior to funds leaving the bank
+ */
+enum TransactionAuthorizationDecision:
+  case ALLOW, REVIEW_HOLD, BLOCK
+
+/**
+ * Full explainable response produced by `TransactionRiskDecisionEngine` when evaluating a `ProposedPaymentTransfer`
+ * against the customer's pre-computed `CustomerSituationState` and `AccountVerificationResult` (Doc/NowePotrzeby.md Section 6).
+ */
+final case class TransactionAuthorizationResponse(
+    transferId: String,
+    customerId: String,
+    fromAccountId: Option[String],
+    toAccountId: String,
+    toCounterpartyId: String,
+    amount: BigDecimal,
+    currency: String,
+    decision: TransactionAuthorizationDecision,
+    riskScore: Int,
+    reviewThresholdScore: Int,
+    blockThresholdScore: Int,
+    policyVersion: String,
+    ruleTraces: List[RuleEvaluationTrace],
+    principalReasons: List[ReasonCode],
+    statementOfReasons: String,
+    accountVerification: AccountVerificationResult,
+    stateVersion: Long,
+    stateFreshnessMs: Long,
+    responseTimeMs: Long,
+    fallbackModeUsed: Boolean,
+    paymentRailDirective: String,
+    evaluatedAt: Instant
+) extends Serializable
