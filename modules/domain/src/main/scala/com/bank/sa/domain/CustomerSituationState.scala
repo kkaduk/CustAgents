@@ -24,6 +24,22 @@ final case class CustomerSituationSummary(
 ) extends Serializable
 
 /**
+ * Natural-language situation summary synthesized by the LLM via `ai-models` (`OpenAiLlmService`)
+ * cyclically (after a configured time interval or transaction count threshold) or on REST wake-up query.
+ * Not executed when the `CustomerAgent` is passivated (idle).
+ */
+final case class LlmSituationSummary(
+    summaryId: String,
+    customerId: String,
+    narrativeDescription: String,
+    triggerReason: String,
+    modelId: String,
+    stateVersion: Long,
+    transactionsProcessedAtSummary: Long,
+    generatedAt: Instant
+) extends Serializable
+
+/**
  * Situation Consistency & Data Completeness metadata (Section 10):
  * "Każda ewaluacja powinna wskazywać wersję sytuacji i stopień kompletności danych.
  *  Agent nie może interpretować braku informacji jako potwierdzenia braku ryzyka."
@@ -197,7 +213,12 @@ final case class CustomerSituationState(
     ownedAccountIds: Set[String] = Set.empty,
     currentPhoneNumber: Option[String] = None,
     contactChangeHistory: List[NormalizedCustomerContactChange] = Nil,
-    servicedByEmployeeIds: Set[String] = Set.empty
+    servicedByEmployeeIds: Set[String] = Set.empty,
+    totalTransactionsProcessed: Long = 0L,
+    txCountSinceLastLlmSummary: Int = 0,
+    lastLlmSummary: Option[LlmSituationSummary] = None,
+    llmSummariesCount: Long = 0L,
+    lastWakeUpReason: String = "INITIAL"
 ) extends Serializable:
 
   /**
@@ -294,9 +315,18 @@ final case class CustomerSituationState(
         lastUpdatedAt = latestTime,
         stateVersion = stateVersion + 1L,
         situationSummary = situationSummary.copy(lastSalaryObserved = lastSalary),
-        ownedAccountIds = updatedAccounts
+        ownedAccountIds = updatedAccounts,
+        totalTransactionsProcessed = totalTransactionsProcessed + 1L,
+        txCountSinceLastLlmSummary = txCountSinceLastLlmSummary + 1
       )
       baseUpdated.recomputeSituationAwareness(latestTime)
+
+  def recordLlmSituationSummary(summary: LlmSituationSummary): CustomerSituationState =
+    copy(
+      lastLlmSummary = Some(summary),
+      txCountSinceLastLlmSummary = 0,
+      llmSummariesCount = llmSummariesCount + 1L
+    )
 
   def recordContactChange(change: NormalizedCustomerContactChange): CustomerSituationState =
     if hasProcessedEvent(change.eventId) then this

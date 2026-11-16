@@ -976,6 +976,86 @@
         </div>
 
       </div>
+
+      <!-- Second Row in Lab: Kafka Hot-Partition Generator & AI-Models LLM Situation Summarizer -->
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+        <!-- Form 4: High-Volume Kafka Transaction Generator (with Hot-Partition Support) -->
+        <div class="glass-card p-4 space-y-3">
+          <div class="border-b border-slate-800 pb-2">
+            <span class="text-[10px] font-bold uppercase text-amber-400">Kafka Stream &middot; Hot-Partition Generator</span>
+            <h3 class="text-sm font-bold text-white mt-0.5">Generator Tysięcy Transakcji Kafka (w tym Hot-Partition)</h3>
+            <p class="text-[11px] text-slate-400">
+              Generuje tysiące transakcji do tematu Kafka (<code class="text-amber-300">sa.transactions.raw.v1</code>, 16 partycji) z koncentracją ruchu na klientach typu <em>Hot-Partition</em> (<code class="text-amber-300">/api/v1/kafka/generate</code>) oraz automatycznym przetwarzaniem w tle.
+            </p>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+            <div>
+              <label class="block text-slate-400 mb-1">Liczba Transakcji</label>
+              <input id="labKafkaTotalTx" type="number" value="2000" min="10" max="50000" class="w-full" />
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Udział Hot-Partition (0.0&ndash;1.0)</label>
+              <input id="labKafkaHotShare" type="number" step="0.05" value="0.65" min="0" max="1" class="w-full" />
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Liczba Normalnych Klientów</label>
+              <input id="labKafkaNormCount" type="number" value="50" min="5" max="1000" class="w-full" />
+            </div>
+          </div>
+          <div class="text-xs">
+            <label class="block text-slate-400 mb-1">Klienci Hot-Partition (rozdzieleni przecinkiem)</label>
+            <input id="labKafkaHotIds" type="text" value="CUST-HOT-MEGA-01, CUST-HOT-WHALE-02, CUST-ALICE-001" class="w-full" />
+          </div>
+
+          <div class="flex flex-wrap gap-2">
+            <button type="button" onclick="window.submitKafkaGenerate()" class="btn-primary flex-1">
+              &#128640; Wygeneruj Masowy Strumień do Kafka
+            </button>
+            <button type="button" onclick="window.refreshKafkaStatus()" class="btn-secondary">
+              &#128202; Odśwież Status Partycji Kafka
+            </button>
+          </div>
+
+          <div id="labKafkaResultBox" class="mt-2 text-xs"></div>
+        </div>
+
+        <!-- Form 5: REST Customer Situation Description & AI-Models Cyclic LLM Summary -->
+        <div class="glass-card p-4 space-y-3">
+          <div class="border-b border-slate-800 pb-2">
+            <span class="text-[10px] font-bold uppercase text-purple-400">Moduł ai-models &middot; OpenAI LLM &amp; Lifecycle Passivation</span>
+            <h3 class="text-sm font-bold text-white mt-0.5">Opis Sytuacji Klienta (REST Wake-Up + Cykliczne Podsumowanie LLM)</h3>
+            <p class="text-[11px] text-slate-400">
+              Pobierz opis sytuacji klienta przez REST (<code class="text-purple-300">GET /api/v1/customers/{id}/situation/description</code>), który budzi agenta (jeśli był <em>passivated</em>) i prezentuje podsumowanie modelu LLM z modułu <code class="text-purple-300">ai-models</code>.
+            </p>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+            <div>
+              <label class="block text-slate-400 mb-1">Klient (CustomerAgent ID)</label>
+              <input id="labLlmCustomerId" type="text" value="CUST-HOT-MEGA-01" class="w-full" />
+            </div>
+            <div class="flex items-end pb-1">
+              <label class="flex items-center gap-1.5 text-slate-300 cursor-pointer">
+                <input id="labLlmForceRefresh" type="checkbox" checked /> Wymuś świeżą syntezę LLM przy zapytaniu
+              </label>
+            </div>
+          </div>
+
+          <div class="flex flex-wrap gap-2">
+            <button type="button" onclick="window.queryCustomerLlmDescription()" class="btn-purple flex-1">
+              &#129302; Pobierz Opis Sytuacji Klienta (REST + LLM Wake-Up)
+            </button>
+            <button type="button" onclick="window.passivateSelectedCustomer()" class="btn-secondary text-amber-300 border-amber-500/40">
+              &#128164; Passivate Agent (Wstrzymaj LLM)
+            </button>
+          </div>
+
+          <div id="labLlmResultBox" class="mt-2 text-xs"></div>
+        </div>
+
+      </div>
     </div>
 
     <!-- =================================================================== -->
@@ -2249,6 +2329,88 @@
 
       window.closeDecisionModal = function () {
         document.getElementById('decisionModal').classList.add('hidden');
+      };
+
+      window.submitKafkaGenerate = async function () {
+        const hotIdsRaw = document.getElementById('labKafkaHotIds').value || '';
+        const hotIds = hotIdsRaw.split(',').map(s => s.trim()).filter(Boolean);
+        const payload = {
+          totalTransactions: Number(document.getElementById('labKafkaTotalTx').value || 2000),
+          hotPartitionTrafficShare: Number(document.getElementById('labKafkaHotShare').value || 0.65),
+          normalCustomersCount: Number(document.getElementById('labKafkaNormCount').value || 50),
+          hotPartitionCustomerIds: hotIds,
+          highRiskRatio: 0.08,
+          topic: 'sa.transactions.raw.v1'
+        };
+        const res = await fetch('/api/v1/kafka/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const b = await res.json();
+        showToast('Wygenerowano ' + b.generatedTransactionsCount + ' transakcji do Kafka (' + b.hotPartitionTransactionsCount + ' hot-partition)!', false);
+        await window.refreshKafkaStatus();
+        await refreshAllData();
+      };
+
+      window.refreshKafkaStatus = async function () {
+        const res = await fetch('/api/v1/kafka/status');
+        if (!res.ok) return;
+        const st = await res.json();
+        const box = document.getElementById('labKafkaResultBox');
+        if (!box) return;
+        const topPartitions = Object.entries(st.partitionDistribution || {})
+          .sort((a, b) => Number(b[1]) - Number(a[1]))
+          .slice(0, 6)
+          .map(([p, c]) => `<span class="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">Partycja ${p}: ${c} tx</span>`)
+          .join(' ');
+        const hotCusts = Object.entries(st.hotCustomersProducedCounts || {})
+          .map(([cid, cnt]) => `<span class="px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 border border-rose-500/30">${cid}: ${cnt} tx</span>`)
+          .join(' ');
+        box.innerHTML = `
+          <div class="glass-subcard p-3 space-y-2 border border-amber-500/30">
+            <div class="flex flex-wrap justify-between gap-2">
+              <span>Tryb Brokera: <strong class="text-amber-300">${st.brokerMode}</strong></span>
+              <span>Wyprodukowano: <strong class="text-emerald-300">${st.totalProduced}</strong> | Przetworzono: <strong class="text-cyan-300">${st.totalConsumedAndEnriched}</strong> | Lag: <strong>${st.pendingQueueLag}</strong></span>
+            </div>
+            <div>Rozkład Hot-Partitions (Top 6 z ${st.numPartitions}): <div class="flex flex-wrap gap-1.5 mt-1">${topPartitions || 'Brak'}</div></div>
+            <div>Klienci Hot-Partition: <div class="flex flex-wrap gap-1.5 mt-1">${hotCusts || 'Brak'}</div></div>
+          </div>
+        `;
+      };
+
+      window.queryCustomerLlmDescription = async function () {
+        const cid = document.getElementById('labLlmCustomerId').value.trim();
+        const force = document.getElementById('labLlmForceRefresh').checked;
+        const res = await fetch('/api/v1/customers/' + encodeURIComponent(cid) + '/situation/description?forceRefresh=' + force);
+        const d = await res.json();
+        showToast('Pobrano opis sytuacji LLM dla ' + cid + ' (' + d.agentLifecycleStatus + ')', false);
+        await refreshAllData();
+        const box = document.getElementById('labLlmResultBox');
+        box.innerHTML = `
+          <div class="glass-subcard p-3 space-y-2 border border-purple-500/40">
+            <div class="flex flex-wrap justify-between gap-2">
+              <span class="font-bold text-purple-300">${d.customerId} (State v${d.stateVersion})</span>
+              <span class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-semibold">${d.agentLifecycleStatus}${d.wokenUpFromPassivationByRestQuery ? ' (Wybudzony z Passivation!)' : ''}</span>
+            </div>
+            <div class="text-slate-300">Przetworzone transakcje: <strong>${d.totalTransactionsProcessed}</strong> | Wykonane podsumowania LLM: <strong>${d.llmSummariesCount}</strong> | Od ostatniego LLM: <strong>${d.txCountSinceLastLlmSummary} tx</strong></div>
+            <div class="p-2.5 rounded bg-slate-950 border border-purple-500/30 text-slate-100 leading-relaxed">${d.llmNarrativeDescription}</div>
+          </div>
+        `;
+      };
+
+      window.passivateSelectedCustomer = async function () {
+        const cid = document.getElementById('labLlmCustomerId').value.trim();
+        const res = await fetch('/api/v1/customers/' + encodeURIComponent(cid) + '/passivate', { method: 'POST' });
+        const d = await res.json();
+        showToast('Agent ' + cid + ' przeszedł w stan PASSIVATED (cykliczne podsumowania LLM wstrzymane)', false);
+        await refreshAllData();
+        const box = document.getElementById('labLlmResultBox');
+        box.innerHTML = `
+          <div class="glass-subcard p-3 border border-amber-500/40 text-amber-300">
+            CustomerAgent(<strong>${d.customerId}</strong>) jest teraz w stanie <strong>${d.lifecycleStatus}</strong>. Cykliczne wywołania modelu LLM z modułu <code>ai-models</code> są wstrzymane do momentu nadejścia nowej transakcji z Kafka lub zapytania REST.
+          </div>
+        `;
       };
 
       // Initial load & interval polling

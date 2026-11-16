@@ -3,6 +3,7 @@ package com.bank.sa.api
 import com.bank.sa.agent.CustomerClusterGateway
 import com.bank.sa.domain.*
 import com.bank.sa.enrichment.EnrichmentLogic
+import com.bank.sa.kafka.{KafkaGeneratorRequest, KafkaTransactionPipeline}
 import org.apache.pekko.actor.typed.ActorSystem
 import org.apache.pekko.cluster.typed.Cluster
 import org.apache.pekko.http.scaladsl.Http
@@ -30,6 +31,7 @@ class LoanOriginationServer(
   private given ExecutionContext = system.executionContext
 
   val grpcService: LoanOriginationGrpcService = new LoanOriginationGrpcServiceImpl(gateway)
+  val kafkaPipeline: KafkaTransactionPipeline = new KafkaTransactionPipeline(gateway, watchlistProvider)
 
   private val corsHeaders = List(
     `Access-Control-Allow-Origin`.*,
@@ -89,7 +91,10 @@ class LoanOriginationServer(
                 val now         = Instant.now()
                 val customerIds = gateway.getActiveCustomerIds
                 val snapshotsFuture = Future.traverse(customerIds) { id =>
-                  grpcService.getCustomerSituation(id, now)
+                  val isPass = gateway.isCustomerPassivated(id)
+                  gateway
+                    .getOverviewSituationStateWithoutWakingPassivated(id)
+                    .map(st => CustomerSituationSnapshotDto.fromDomain(st, now, isPass))
                 }
                 onComplete(snapshotsFuture) {
                   case Success(snapshots) =>
@@ -106,7 +111,9 @@ class LoanOriginationServer(
                       recentTransferAuthorizations = repo.getTransactionAuthorizationAuditLog,
                       accountHistoryRegistry = repo.getAccountHistoryRegistry,
                       contactChangeHistory = repo.getContactChangeHistory,
-                      employees = repo.getEmployees
+                      employees = repo.getEmployees,
+                      passivatedCustomerIds = gateway.getPassivatedCustomerIds,
+                      recentLlmSummaries = gateway.getRecentLlmSummaries
                     )
                     complete(StatusCodes.OK, overview)
                   case Failure(ex) =>
@@ -193,16 +200,68 @@ class LoanOriginationServer(
               }
             },
 
+            // /api/v1/kafka/... — High-Volume Kafka Transaction Generator (with Hot-Partition support) & Auto-Consumer Status
+            pathPrefix("kafka") {
+              concat(
+                // POST /api/v1/kafka/generate — Generate thousands of transactions (including hot-partition customers) into Kafka
+                path("generate") {
+                  post {
+                    entity(as[KafkaGeneratorRequest]) { genReq =>
+                      val batchRes = kafkaPipeline.generateAndPublishTransactions(genReq)
+                      complete(StatusCodes.OK, batchRes)
+                    }
+                  }
+                },
+                // GET /api/v1/kafka/status — Inspect Kafka partition distribution, hot-partition counts, and automatic consumer progress
+                path("status") {
+                  get {
+                    complete(StatusCodes.OK, kafkaPipeline.getStatus)
+                  }
+                }
+              )
+            },
+
             // /api/v1/customers/{customerId}/...
             pathPrefix("customers" / Segment) { customerId =>
               concat(
-                // GET /api/v1/customers/{customerId}/situation
+                // GET /api/v1/customers/{customerId}/situation/description — Wakes up CustomerAgent (if passivated) and returns LLM Situation Description
+                path("situation" / "description") {
+                  get {
+                    parameters("forceRefresh".as[Boolean].withDefault(false)) { forceRefresh =>
+                      val now = Instant.now()
+                      onComplete(gateway.getOrGenerateCustomerSituationDescription(customerId, forceRefresh, "REST_DESCRIPTION_ENDPOINT")) {
+                        case Success((state, wasWokenUp)) =>
+                          val dto = CustomerSituationDescriptionDto.fromDomain(state, wasWokenUp, now)
+                          complete(StatusCodes.OK, dto)
+                        case Failure(ex) =>
+                          complete(StatusCodes.InternalServerError, Map("error" -> ex.getMessage))
+                      }
+                    }
+                  }
+                },
+
+                // GET /api/v1/customers/{customerId}/situation — Wakes up CustomerAgent (if passivated) and returns full situation snapshot
                 path("situation") {
                   get {
                     onComplete(grpcService.getCustomerSituation(customerId, Instant.now())) {
                       case Success(snapshotDto) => complete(StatusCodes.OK, snapshotDto)
                       case Failure(ex)          => complete(StatusCodes.InternalServerError, Map("error" -> ex.getMessage))
                     }
+                  }
+                },
+
+                // POST /api/v1/customers/{customerId}/passivate — Passivates CustomerAgent (stops cyclic LLM summaries while idle)
+                path("passivate") {
+                  post {
+                    gateway.passivateCustomerAgent(customerId)
+                    complete(
+                      StatusCodes.OK,
+                      Map(
+                        "customerId" -> customerId,
+                        "lifecycleStatus" -> "PASSIVATED",
+                        "llmSummariesSuspended" -> "true"
+                      )
+                    )
                   }
                 },
 
@@ -369,7 +428,8 @@ class LoanOriginationServer(
     val now = Instant.now()
     stepName match
       case "step0-reset" =>
-        gateway.resetAll().map(_ => "Workbench state reset: all 5 sharded agent types, Oracle Exadata schemas, and telemetry logs cleared.")
+        kafkaPipeline.resetCounters()
+        gateway.resetAll().map(_ => "Workbench state reset: all 5 sharded agent types, Kafka pipeline counters, Oracle Exadata schemas, and telemetry logs cleared.")
 
       case "step1-bootstrap" =>
         val docs = Seq(
@@ -561,6 +621,128 @@ class LoanOriginationServer(
           _        <- Future.traverse(enriched)(gateway.ingestTransaction)
           patterns <- gateway.runGlobalGraphAnalysis(now)
         yield s"Step 5 complete: Oracle Exadata Global Graph (SA_GRAPH) detected ${patterns.size} multi-account risk pattern(s) and emitted NetworkRiskPatternDetected to CustomerAgents & PortfolioRiskAgent!"
+
+      case "step6-employee-phone-and-own-accounts" =>
+        gateway.registerEmployee(
+          EmployeeProfile(
+            employeeId = "EMP-MAREK-NOWAK-07",
+            fullName = "Marek Nowak (Relationship Manager)",
+            role = "Relationship Manager",
+            branchId = "BRANCH-WARSAW-CENTRAL",
+            phoneNumberRaw = "500 100 200",
+            phoneNumberNormalized = "500100200",
+            servicedCustomerIds = List("CUST-ALICE-001"),
+            registeredAt = now.minus(30, ChronoUnit.DAYS)
+          )
+        )
+        gateway.registerCustomerAccount(CustomerAccount("PL10-ALICE-KONTO-1", "CUST-ALICE-001", "CHECKING", "PLN", now.minus(60, ChronoUnit.DAYS)))
+        gateway.registerCustomerAccount(CustomerAccount("PL20-ALICE-KONTO-2", "CUST-ALICE-001", "SAVINGS", "PLN", now.minus(60, ChronoUnit.DAYS)))
+
+        val ownTxRaw = RawTransaction(
+          txId = "TX-OWN-ALICE-20000",
+          fromCustomerId = "CUST-ALICE-001",
+          toCounterpartyId = "CUST-ALICE-001",
+          counterpartyIsBankClient = true,
+          amount = BigDecimal("20000.00"),
+          currency = "PLN",
+          category = TransactionCategory.InternalOwnAccountTransfer,
+          resultsInOverdraft = false,
+          timestamp = now.minus(20, ChronoUnit.MINUTES),
+          merchantDescription = Some("PRZELEW WLASNY KONTO 1 -> KONTO 2"),
+          fromAccountId = Some("PL10-ALICE-KONTO-1"),
+          toAccountId = Some("PL20-ALICE-KONTO-2")
+        )
+        val ownEnriched = EnrichmentLogic.enrichBatchInMemory(Seq(ownTxRaw), watchlistProvider())
+        val phoneChange = RawCustomerContactChange(
+          eventId = "EVT-PHONE-CHG-ALICE-01",
+          customerId = "CUST-ALICE-001",
+          previousPhoneRaw = Some("+48 601-222-333"),
+          newPhoneRaw = "500 100 200",
+          sourceSystem = "CRM-BRANCH-TERMINAL",
+          changedByEmployeeId = Some("EMP-MAREK-NOWAK-07"),
+          occurredAt = now.minus(10, ChronoUnit.MINUTES)
+        )
+        for
+          _          <- Future.traverse(ownEnriched)(gateway.ingestTransaction)
+          normChange <- gateway.ingestCustomerContactChange(phoneChange)
+        yield s"Step 6 complete: Registered own accounts (PL10-ALICE-KONTO-1 -> PL20-ALICE-KONTO-2 20,000 PLN isolated from external cashflow) & detected EMPLOYEE_CUSTOMER_PHONE_MATCH (Employee ${normChange.matchedEmployeeId.getOrElse("")} shares phone ${normChange.newPhoneNormalized} with serviced client CUST-ALICE-001)!"
+
+      case "step7-mule-chain-and-payment-blocking" =>
+        val muleChainTxs = Seq(
+          RawTransaction(
+            txId = "TX-MULE-HOP1-50000",
+            fromCustomerId = "CUST-ALICE-001",
+            toCounterpartyId = "CUST-MULE-B-900",
+            counterpartyIsBankClient = true,
+            amount = BigDecimal("50000.00"),
+            currency = "PLN",
+            category = TransactionCategory.PeerTransfer,
+            resultsInOverdraft = false,
+            timestamp = now.minus(8, ChronoUnit.MINUTES),
+            fromAccountId = Some("PL20-ALICE-KONTO-2"),
+            toAccountId = Some("PL55-MULE-B-ACC")
+          ),
+          RawTransaction(
+            txId = "TX-MULE-HOP2-49500",
+            fromCustomerId = "CUST-MULE-B-900",
+            toCounterpartyId = "CUST-MULE-C-901",
+            counterpartyIsBankClient = true,
+            amount = BigDecimal("49500.00"),
+            currency = "PLN",
+            category = TransactionCategory.PeerTransfer,
+            resultsInOverdraft = false,
+            timestamp = now.minus(6, ChronoUnit.MINUTES),
+            fromAccountId = Some("PL55-MULE-B-ACC"),
+            toAccountId = Some("PL66-MULE-C-ACC")
+          ),
+          RawTransaction(
+            txId = "TX-MULE-HOP3-49000",
+            fromCustomerId = "CUST-MULE-C-901",
+            toCounterpartyId = "EXT-CASHOUT-HUB-999",
+            counterpartyIsBankClient = false,
+            amount = BigDecimal("49000.00"),
+            currency = "PLN",
+            category = TransactionCategory.HighRiskTransfer,
+            resultsInOverdraft = false,
+            timestamp = now.minus(4, ChronoUnit.MINUTES),
+            fromAccountId = Some("PL66-MULE-C-ACC"),
+            toAccountId = Some("PL99-EXT-CASHOUT-ACC")
+          )
+        )
+        val enrichedMule = EnrichmentLogic.enrichBatchInMemory(muleChainTxs, watchlistProvider())
+        val proposedTransfer = ProposedPaymentTransfer(
+          transferId = "TX-PREAUTH-BLOCK-001",
+          customerId = "CUST-ALICE-001",
+          fromAccountId = Some("PL20-ALICE-KONTO-2"),
+          toAccountId = "PL88-UNKNOWN-MULE-9999",
+          toCounterpartyId = "CUST-MULE-B-900",
+          amount = BigDecimal("25000.00"),
+          currency = "PLN",
+          title = "Pilny przelew inwestycyjny",
+          isVerificationOnePlnTransfer = false,
+          requestedAt = now
+        )
+        for
+          _        <- Future.traverse(enrichedMule)(gateway.ingestTransaction)
+          patterns <- gateway.runGlobalGraphAnalysis(now)
+          _        <- gateway.verifyAccountForOnePlnTransfer("CUST-ALICE-001", "PL88-UNKNOWN-MULE-9999", BigDecimal("1.00"), now)
+          authResp <- gateway.evaluateTransferBeforeExecution(proposedTransfer, watchlistProvider())
+        yield s"Step 7 complete: Detected ${patterns.size} graph patterns (including RapidPassThrough & MultiHopMoneyMovement), verified 1 PLN unknown account history, and Pre-Execution TransactionRiskDecisionEngine returned ${authResp.decision} (Score=${authResp.riskScore}/100, Directive=${authResp.paymentRailDirective})!"
+
+      case "step8-kafka-hot-partition-and-llm" =>
+        val batchRes = kafkaPipeline.generateAndPublishTransactions(
+          KafkaGeneratorRequest(
+            totalTransactions = 1200,
+            normalCustomersCount = 40,
+            hotPartitionCustomerIds = List("CUST-HOT-MEGA-01", "CUST-HOT-WHALE-02", "CUST-ALICE-001"),
+            hotPartitionTrafficShare = 0.65,
+            highRiskRatio = 0.10
+          )
+        )
+        for
+          _                 <- kafkaPipeline.drainAvailableTransactions(1200)
+          (hotState, _)     <- gateway.getOrGenerateCustomerSituationDescription("CUST-HOT-MEGA-01", forceRefresh = true, "DEMO_STEP8_HOT_PARTITION")
+        yield s"Step 8 complete: Generated ${batchRes.generatedTransactionsCount} Kafka txs (${batchRes.hotPartitionTransactionsCount} hot-partition txs) and synthesized LLM situation summary for CUST-HOT-MEGA-01 (processed=${hotState.totalTransactionsProcessed} txs, LLM model=${hotState.lastLlmSummary.map(_.modelId).getOrElse("gpt-4o-mini")})!"
 
       case other =>
         Future.failed(new IllegalArgumentException(s"Unknown demo scenario step: $other"))

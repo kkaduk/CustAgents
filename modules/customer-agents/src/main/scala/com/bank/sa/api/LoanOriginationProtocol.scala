@@ -325,11 +325,20 @@ final case class CustomerSituationSnapshotDto(
     maxNetworkRiskScore: Double,
     riskExposures: List[RiskExposureDto],
     pendingOutboxCount: Int,
-    lastUpdatedAt: Instant
+    lastUpdatedAt: Instant,
+    agentLifecycleStatus: String = "ACTIVE",
+    totalTransactionsProcessed: Long = 0L,
+    txCountSinceLastLlmSummary: Int = 0,
+    llmSummariesCount: Long = 0L,
+    lastLlmSummary: Option[LlmSituationSummary] = None
 )
 
 object CustomerSituationSnapshotDto:
-  def fromDomain(state: CustomerSituationState, referenceTime: Instant): CustomerSituationSnapshotDto =
+  def fromDomain(
+      state: CustomerSituationState,
+      referenceTime: Instant,
+      isPassivated: Boolean = false
+  ): CustomerSituationSnapshotDto =
     val ref        = if state.lastUpdatedAt.isAfter(Instant.EPOCH) then state.lastUpdatedAt else referenceTime
     val metrics30d = state.cashflow.metricsForWindow(ref, Duration.ofDays(30))
     val factsMap = state.verifiedFacts.map { case (k, v) =>
@@ -374,7 +383,82 @@ object CustomerSituationSnapshotDto:
       maxNetworkRiskScore = state.maxNetworkRiskScore,
       riskExposures = exposures,
       pendingOutboxCount = state.pendingOutbox.size,
-      lastUpdatedAt = state.lastUpdatedAt
+      lastUpdatedAt = state.lastUpdatedAt,
+      agentLifecycleStatus = if isPassivated then "PASSIVATED" else "ACTIVE",
+      totalTransactionsProcessed = state.totalTransactionsProcessed,
+      txCountSinceLastLlmSummary = state.txCountSinceLastLlmSummary,
+      llmSummariesCount = state.llmSummariesCount,
+      lastLlmSummary = state.lastLlmSummary
+    )
+
+/**
+ * REST response providing the comprehensive description of a customer's situation (including the LLM narrative summary
+ * synthesized via `ai-models`), waking up the `CustomerAgent` if it was previously passivated.
+ */
+final case class CustomerSituationDescriptionDto(
+    customerId: String,
+    agentLifecycleStatus: String,
+    wokenUpFromPassivationByRestQuery: Boolean,
+    stateVersion: Long,
+    ruleVersion: String,
+    financialSituationStatus: String,
+    monthlyIncome: BigDecimal,
+    incomeStability: String,
+    liquidityTrend: String,
+    inflow30d: BigDecimal,
+    outflow30d: BigDecimal,
+    netCashflow30d: BigDecimal,
+    highRiskSpend30d: BigDecimal,
+    overdraftCount30d: Int,
+    internalOwnTransferVolume30d: BigDecimal,
+    totalTransactionsProcessed: Long,
+    txCountSinceLastLlmSummary: Int,
+    llmSummariesCount: Long,
+    llmNarrativeDescription: String,
+    llmSummaryMetadata: Option[LlmSituationSummary],
+    maxNetworkRiskScore: Double,
+    activeRiskExposures: List[RiskExposureDto],
+    completenessScore: Double,
+    completenessLevel: String,
+    queriedAt: Instant
+)
+
+object CustomerSituationDescriptionDto:
+  def fromDomain(
+      state: CustomerSituationState,
+      wasWokenUp: Boolean,
+      queriedAt: Instant
+  ): CustomerSituationDescriptionDto =
+    val snap = CustomerSituationSnapshotDto.fromDomain(state, queriedAt, isPassivated = false)
+    val narrative = state.lastLlmSummary.map(_.narrativeDescription).getOrElse(
+      s"Klient ${state.customerId} (v${state.stateVersion}): status=${state.situationSummary.financialSituationStatus}, dochód=${state.situationSummary.monthlyIncome}, stabilność=${state.situationSummary.incomeStability}, trend=${state.situationSummary.liquidityTrend}."
+    )
+    CustomerSituationDescriptionDto(
+      customerId = state.customerId,
+      agentLifecycleStatus = if wasWokenUp then "WOKEN_UP_BY_REST_QUERY" else "ACTIVE",
+      wokenUpFromPassivationByRestQuery = wasWokenUp,
+      stateVersion = state.stateVersion,
+      ruleVersion = state.ruleVersion,
+      financialSituationStatus = snap.financialSituationStatus,
+      monthlyIncome = state.situationSummary.monthlyIncome,
+      incomeStability = snap.incomeStability,
+      liquidityTrend = snap.liquidityTrend,
+      inflow30d = snap.inflow30d,
+      outflow30d = snap.outflow30d,
+      netCashflow30d = snap.netCashflow30d,
+      highRiskSpend30d = snap.highRiskSpend30d,
+      overdraftCount30d = snap.overdraftCount30d,
+      internalOwnTransferVolume30d = snap.internalOwnTransferVolume30d,
+      totalTransactionsProcessed = state.totalTransactionsProcessed,
+      txCountSinceLastLlmSummary = state.txCountSinceLastLlmSummary,
+      llmSummariesCount = state.llmSummariesCount,
+      llmNarrativeDescription = narrative,
+      llmSummaryMetadata = state.lastLlmSummary,
+      maxNetworkRiskScore = snap.maxNetworkRiskScore,
+      activeRiskExposures = snap.riskExposures,
+      completenessScore = snap.completenessScore,
+      completenessLevel = snap.completenessLevel,
+      queriedAt = queriedAt
     )
 
 final case class IngestionAckDto(
@@ -433,7 +517,9 @@ final case class SystemOverviewDto(
     recentTransferAuthorizations: List[TransactionAuthorizationResponse] = Nil,
     accountHistoryRegistry: List[AccountVerificationResult] = Nil,
     contactChangeHistory: List[NormalizedCustomerContactChange] = Nil,
-    employees: List[EmployeeProfile] = Nil
+    employees: List[EmployeeProfile] = Nil,
+    passivatedCustomerIds: List[String] = Nil,
+    recentLlmSummaries: List[LlmSituationSummary] = Nil
 )
 
 final case class OracleExadataOverviewDto(

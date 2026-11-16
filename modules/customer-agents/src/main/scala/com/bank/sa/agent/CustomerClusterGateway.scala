@@ -4,14 +4,14 @@ import com.bank.sa.api.{LoanOriginationDecisionDto, WorkflowTraceEventDto}
 import com.bank.sa.domain.*
 import com.bank.sa.engine.{ExplainableCreditEngine, TransactionRiskDecisionEngine}
 import com.bank.sa.enrichment.EnrichmentLogic
+import com.bank.sa.llm.{CustomerSituationLlmSummarizer, OpenAiLlmService}
 import com.bank.sa.oracle.OracleExadataRepository
 import org.apache.pekko.actor.typed.ActorSystem
 import org.apache.pekko.cluster.sharding.typed.scaladsl.{ClusterSharding, Entity, EntityRef}
 import org.apache.pekko.util.Timeout
 
 import java.time.Instant
-import java.util.concurrent.ConcurrentLinkedDeque
-import java.util.concurrent.ConcurrentSkipListSet
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedDeque, ConcurrentSkipListSet}
 import java.util.concurrent.atomic.AtomicLong
 import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.*
@@ -33,14 +33,24 @@ class CustomerClusterGateway(
     creditEngine: ExplainableCreditEngine,
     val oracleRepository: OracleExadataRepository = new OracleExadataRepository(),
     val pluginRegistry: EventPluginRegistry = EventPluginRegistry.default,
-    val txRiskEngine: TransactionRiskDecisionEngine = new TransactionRiskDecisionEngine()
+    val txRiskEngine: TransactionRiskDecisionEngine = new TransactionRiskDecisionEngine(),
+    val llmSummarizerOpt: Option[CustomerSituationLlmSummarizer] = None,
+    val llmTxCountThreshold: Int = 10,
+    val llmSummaryInterval: FiniteDuration = 15.seconds,
+    val passivationIdleTimeout: FiniteDuration = 30.minutes
 ):
   private given Timeout          = Timeout(5.seconds)
   private given ExecutionContext = system.executionContext
   private val sharding           = ClusterSharding(system)
 
+  val llmSummarizer: CustomerSituationLlmSummarizer =
+    llmSummarizerOpt.getOrElse(OpenAiLlmService.create(using system, system.executionContext))
+
   private val seqCounter            = new AtomicLong(0L)
   private val knownCustomers        = new ConcurrentSkipListSet[String]()
+  private val passivatedCustomers   = new ConcurrentSkipListSet[String]()
+  private val cachedCustomerStates  = new ConcurrentHashMap[String, CustomerSituationState]()
+  private val recentLlmSummaries    = new ConcurrentLinkedDeque[LlmSituationSummary]()
   private val knownRelationships    = new ConcurrentSkipListSet[String]()
   private val knownSegments         = new ConcurrentSkipListSet[String]()
   private val knownSubSegments      = new ConcurrentSkipListSet[String]()
@@ -141,6 +151,8 @@ class CustomerClusterGateway(
         result: PluginProcessingResult
     ): Unit =
       val persistenceId = s"CustomerAgent:$customerId"
+      passivatedCustomers.remove(customerId)
+      cachedCustomerStates.put(customerId, result.updatedState)
 
       // 1. Record in Oracle Exadata SA_PERSISTENCE (Batched Event Journal + SituationEvaluated + Bounded Snapshot + Transactional Outbox)
       oracleRepository.appendJournalEventsBatch(
@@ -220,6 +232,77 @@ class CustomerClusterGateway(
           .tell(RiskSignalAgent.DispatchAndTrackSignal(sig, None))
       }
 
+    override def onLlmSummaryCompleted(
+        customerId: String,
+        summary: LlmSituationSummary,
+        updatedState: CustomerSituationState
+    ): Unit =
+      cachedCustomerStates.put(customerId, updatedState)
+      recentLlmSummaries.addFirst(summary)
+      while recentLlmSummaries.size() > 100 do recentLlmSummaries.removeLast()
+      oracleRepository.appendJournalEvent(
+        persistenceId = s"CustomerAgent:$customerId",
+        eventType = "LlmSituationSummarized",
+        payloadSummary = s"summaryId=${summary.summaryId}, trigger=${summary.triggerReason}, model=${summary.modelId}, txCount=${summary.transactionsProcessedAtSummary}",
+        timestamp = summary.generatedAt
+      )
+      recordTrace(
+        stage = "AI_MODELS_LLM",
+        fromComponent = s"CustomerAgent($customerId)",
+        toComponent = s"OpenAiLlmService(${summary.modelId})",
+        eventType = s"LlmSituationSummarized (${summary.triggerReason})",
+        summary = summary.narrativeDescription,
+        details = Map(
+          "summaryId" -> summary.summaryId,
+          "customerId" -> customerId,
+          "triggerReason" -> summary.triggerReason,
+          "modelId" -> summary.modelId,
+          "stateVersion" -> s"v${summary.stateVersion}",
+          "transactionsAtSummary" -> summary.transactionsProcessedAtSummary.toString
+        ),
+        timestamp = summary.generatedAt
+      )
+
+    override def onAgentWokenUp(
+        customerId: String,
+        wakeUpReason: String,
+        stateVersion: Long
+    ): Unit =
+      val wasPassivated = passivatedCustomers.remove(customerId)
+      if wasPassivated then
+        recordTrace(
+          stage = "PEKKO_SHARD_ACTOR",
+          fromComponent = wakeUpReason,
+          toComponent = s"CustomerAgent($customerId)",
+          eventType = s"CustomerAgentWokenUp ($wakeUpReason)",
+          summary = s"CustomerAgent($customerId) woken up from PASSIVATED state by '$wakeUpReason' at stateVersion=v$stateVersion",
+          details = Map(
+            "customerId" -> customerId,
+            "wakeUpReason" -> wakeUpReason,
+            "stateVersion" -> s"v$stateVersion",
+            "lifecycleStatus" -> "ACTIVE"
+          )
+        )
+
+    override def onAgentPassivated(
+        customerId: String,
+        stateVersion: Long
+    ): Unit =
+      passivatedCustomers.add(customerId)
+      recordTrace(
+        stage = "PEKKO_SHARD_ACTOR",
+        fromComponent = s"CustomerAgent($customerId)",
+        toComponent = "PekkoClusterSharding(Passivate)",
+        eventType = "CustomerAgentPassivated (Idle — LLM Paused)",
+        summary = s"CustomerAgent($customerId) passivated due to inactivity at stateVersion=v$stateVersion; cyclic LLM summaries suspended while passivated.",
+        details = Map(
+          "customerId" -> customerId,
+          "stateVersion" -> s"v$stateVersion",
+          "lifecycleStatus" -> "PASSIVATED",
+          "llmSummariesActive" -> "false"
+        )
+      )
+
   // --- INITIALIZE ALL 5 SHARDED AGENT TYPES ON THIS CLUSTER NODE (Section 6) ---
 
   // 1. CustomerAgent
@@ -229,7 +312,12 @@ class CustomerClusterGateway(
         customerId = entityContext.entityId,
         creditEngine = creditEngine,
         peerRiskRouter = shardedRiskRouter,
-        pluginRegistry = pluginRegistry
+        pluginRegistry = pluginRegistry,
+        llmSummarizer = Some(llmSummarizer),
+        llmTxCountThreshold = llmTxCountThreshold,
+        llmSummaryInterval = llmSummaryInterval,
+        passivationIdleTimeout = passivationIdleTimeout,
+        shardOpt = Some(entityContext.shard)
       )
     }.withStopMessage(CustomerAgent.Passivate)
   )
@@ -633,7 +721,56 @@ class CustomerClusterGateway(
     oracleRepository.investigateGraph(rootEntityId, depth, relationshipTypeFilter, Instant.now())
 
   def getSituationState(customerId: String): Future[CustomerSituationState] =
-    entityFor(customerId).ask(replyTo => CustomerAgent.GetSituationState(replyTo))
+    entityFor(customerId)
+      .ask[CustomerSituationState](replyTo => CustomerAgent.GetSituationState(replyTo))
+      .map { state =>
+        cachedCustomerStates.put(customerId, state)
+        state
+      }
+
+  /**
+   * Wakes up `CustomerAgent(customerId)` (if passivated) in response to a REST query for the customer's situation description,
+   * and returns `(CustomerSituationState, wasWokenUpFromPassivation)`.
+   */
+  def getOrGenerateCustomerSituationDescription(
+      customerId: String,
+      forceRefresh: Boolean = false,
+      wakeUpSource: String = "REST_DESCRIPTION_ENDPOINT"
+  ): Future[(CustomerSituationState, Boolean)] =
+    val wasPassivated = passivatedCustomers.contains(customerId)
+    entityFor(customerId)
+      .ask[CustomerSituationState](replyTo =>
+        CustomerAgent.GetOrGenerateSituationDescription(forceRefresh, wakeUpSource, replyTo)
+      )
+      .map { state =>
+        cachedCustomerStates.put(customerId, state)
+        (state, wasPassivated)
+      }
+
+  /**
+   * Used by the background dashboard `/api/v1/system/overview` endpoint so that polling the overview dashboard
+   * does NOT inadvertently wake up passivated `CustomerAgent`s.
+   */
+  def getOverviewSituationStateWithoutWakingPassivated(customerId: String): Future[CustomerSituationState] =
+    if passivatedCustomers.contains(customerId) then
+      Future.successful(Option(cachedCustomerStates.get(customerId)).getOrElse(CustomerSituationState.empty(customerId)))
+    else
+      getSituationState(customerId)
+
+  /**
+   * Passivates `CustomerAgent(customerId)` so it stops processing timers/LLM summaries until woken up by Kafka or REST.
+   */
+  def passivateCustomerAgent(customerId: String): Unit =
+    sharding.entityRefFor(CustomerAgent.TypeKey, customerId).tell(CustomerAgent.RequestPassivate)
+
+  def isCustomerPassivated(customerId: String): Boolean =
+    passivatedCustomers.contains(customerId)
+
+  def getPassivatedCustomerIds: List[String] =
+    passivatedCustomers.asScala.toList
+
+  def getRecentLlmSummaries: List[LlmSituationSummary] =
+    recentLlmSummaries.asScala.toList
 
   def getRelationshipStates: Future[List[RelationshipSituationState]] =
     val relIds = knownRelationships.asScala.toList
@@ -725,6 +862,9 @@ class CustomerClusterGateway(
       }
     yield
       knownCustomers.clear()
+      passivatedCustomers.clear()
+      cachedCustomerStates.clear()
+      recentLlmSummaries.clear()
       knownRelationships.clear()
       knownSubSegments.clear()
       knownRiskCoordinators.clear()

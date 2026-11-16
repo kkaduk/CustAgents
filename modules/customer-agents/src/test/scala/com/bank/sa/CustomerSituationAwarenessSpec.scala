@@ -570,4 +570,94 @@ class CustomerSituationAwarenessSpec
       gateway.oracleRepository.GlobalGraphPgqSql should include("GRAPH_TABLE")
       gateway.oracleRepository.GlobalGraphPgqSql should include("SA_GRAPH.SA_GLOBAL_RELATIONSHIP_GRAPH")
     }
+
+    "generate thousands of transactions (including Hot-Partition customers) via Kafka, automatically process them, execute cyclic LLM situation summaries via ai-models, suppress LLM when passivated, and wake up CustomerAgent on REST description query or new Kafka transaction" in {
+      import JacksonJsonSupport.given
+      import com.bank.sa.kafka.{KafkaGenerationBatchResult, KafkaGeneratorRequest, KafkaPipelineStatusDto}
+      given scala.concurrent.ExecutionContext = system.executionContext
+
+      val server  = new LoanOriginationServer(gateway)
+      val binding = server.start("127.0.0.1", 0).futureValue
+      val baseUrl = s"http://127.0.0.1:${binding.localAddress.getPort}"
+
+      try
+        // 1. Trigger Kafka generator via POST /api/v1/kafka/generate with 1,200 transactions & hot-partition customers
+        val genReq = KafkaGeneratorRequest(
+          totalTransactions = 1200,
+          normalCustomersCount = 30,
+          hotPartitionCustomerIds = List("CUST-HOT-MEGA-01", "CUST-HOT-WHALE-02"),
+          hotPartitionTrafficShare = 0.70,
+          highRiskRatio = 0.08
+        )
+        val genEntity = Marshal(genReq).to[RequestEntity].futureValue
+        val genResp = Http()(using system)
+          .singleRequest(
+            HttpRequest(
+              method = HttpMethods.POST,
+              uri = s"$baseUrl/api/v1/kafka/generate",
+              entity = genEntity
+            )
+          )
+          .futureValue
+        genResp.status shouldBe StatusCodes.OK
+        val batchRes = Unmarshal(genResp.entity).to[KafkaGenerationBatchResult].futureValue
+        batchRes.generatedTransactionsCount shouldBe 1200
+        batchRes.hotPartitionTransactionsCount should be > 600
+        batchRes.hotCustomerCounts.getOrElse("CUST-HOT-MEGA-01", 0) should be > 200
+
+        // 2. Verify automatic background consumption from Kafka and cyclic LLM situation summary via ai-models
+        eventually(timeout(scaled(15.seconds)), interval(scaled(200.millis))) {
+          val statusResp = Http()(using system)
+            .singleRequest(HttpRequest(uri = s"$baseUrl/api/v1/kafka/status"))
+            .futureValue
+          statusResp.status shouldBe StatusCodes.OK
+          val kStatus = Unmarshal(statusResp.entity).to[KafkaPipelineStatusDto].futureValue
+          kStatus.totalProduced should be >= 1200L
+          kStatus.totalConsumedAndEnriched should be >= 1200L
+          kStatus.pendingQueueLag shouldBe 0L
+
+          val hotState = gateway.getSituationState("CUST-HOT-MEGA-01").futureValue
+          hotState.totalTransactionsProcessed should be >= 200L
+          // Because llmTxCountThreshold = 10, cyclic LLM summaries were automatically executed via ai-models!
+          hotState.llmSummariesCount should be >= 1L
+          hotState.lastLlmSummary shouldBe defined
+          hotState.lastLlmSummary.value.narrativeDescription should include("CUST-HOT-MEGA-01")
+        }
+
+        // 3. Passivate CUST-HOT-MEGA-01 via POST /api/v1/customers/CUST-HOT-MEGA-01/passivate
+        //    Verify that while passivated, cyclic LLM summaries are suspended
+        val passResp = Http()(using system)
+          .singleRequest(
+            HttpRequest(
+              method = HttpMethods.POST,
+              uri = s"$baseUrl/api/v1/customers/CUST-HOT-MEGA-01/passivate"
+            )
+          )
+          .futureValue
+        passResp.status shouldBe StatusCodes.OK
+        eventually {
+          gateway.isCustomerPassivated("CUST-HOT-MEGA-01") shouldBe true
+        }
+
+        // 4. Query REST endpoint GET /api/v1/customers/CUST-HOT-MEGA-01/situation/description
+        //    Verify that it wakes up the passivated CustomerAgent and returns the LLM situation description!
+        val descResp = Http()(using system)
+          .singleRequest(
+            HttpRequest(
+              method = HttpMethods.GET,
+              uri = s"$baseUrl/api/v1/customers/CUST-HOT-MEGA-01/situation/description?forceRefresh=true"
+            )
+          )
+          .futureValue
+        descResp.status shouldBe StatusCodes.OK
+        val descDto = Unmarshal(descResp.entity).to[CustomerSituationDescriptionDto].futureValue
+        descDto.customerId shouldBe "CUST-HOT-MEGA-01"
+        descDto.wokenUpFromPassivationByRestQuery shouldBe true
+        descDto.agentLifecycleStatus shouldBe "WOKEN_UP_BY_REST_QUERY"
+        descDto.llmNarrativeDescription should include("CUST-HOT-MEGA-01")
+        gateway.isCustomerPassivated("CUST-HOT-MEGA-01") shouldBe false
+      finally
+        server.kafkaPipeline.close()
+        binding.unbind().futureValue
+    }
   }
