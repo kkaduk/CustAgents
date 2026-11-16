@@ -37,8 +37,9 @@ class ExplainableCreditEngine(val config: CreditPolicyConfig = CreditPolicyConfi
     val refTime       = application.requestedAt
     val metrics30d    = state.cashflow.metricsForWindow(refTime, Duration.ofDays(30))
     val installment   = application.estimatedMonthlyInstallment
-    val docIncomeOpt  = state.verifiedFacts.get(DocumentFactType.VerifiedMonthlyNetIncome).flatMap(_.numericValue)
-    val externalDebt  = state.verifiedFacts.get(DocumentFactType.ExternalDebtObligation).flatMap(_.numericValue).getOrElse(BigDecimal(0))
+    val cleanFacts    = state.normalizedVerifiedFacts
+    val docIncomeOpt  = cleanFacts.get(DocumentFactType.VerifiedMonthlyNetIncome).flatMap(_.numericValue)
+    val externalDebt  = cleanFacts.get(DocumentFactType.ExternalDebtObligation).flatMap(_.numericValue).getOrElse(BigDecimal(0))
     val monthlyIncome = docIncomeOpt.getOrElse(metrics30d.totalInflow)
 
     val totalProjectedDebt = externalDebt + installment
@@ -171,8 +172,9 @@ class ExplainableCreditEngine(val config: CreditPolicyConfig = CreditPolicyConfi
       app: LoanApplication,
       proposedInstallment: BigDecimal
   ): RuleEvaluationTrace =
-    val docIncomeOpt    = state.verifiedFacts.get(DocumentFactType.VerifiedMonthlyNetIncome)
-    val externalDebtOpt = state.verifiedFacts.get(DocumentFactType.ExternalDebtObligation)
+    val cleanFacts      = state.normalizedVerifiedFacts
+    val docIncomeOpt    = cleanFacts.get(DocumentFactType.VerifiedMonthlyNetIncome)
+    val externalDebtOpt = cleanFacts.get(DocumentFactType.ExternalDebtObligation)
 
     val verifiedIncome = docIncomeOpt.flatMap(_.numericValue).getOrElse(metrics30d.totalInflow)
     val externalDebt   = externalDebtOpt.flatMap(_.numericValue).getOrElse(BigDecimal(0))

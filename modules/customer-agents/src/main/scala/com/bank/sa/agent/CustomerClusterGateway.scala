@@ -108,20 +108,26 @@ class CustomerClusterGateway(
       val coordinatorKey = RiskSignalAgentState.coordinatorKeyFor(signal.signalId)
       knownRiskCoordinators.add(coordinatorKey)
 
-      targetEntity
-        .ask[CustomerAgent.IngestionAck](replyTo => CustomerAgent.PropagatePeerRisk(signal, Some(replyTo)))
-        .foreach { _ =>
-          val ackTime = Instant.now()
-          sharding
-            .entityRefFor(RiskSignalAgent.TypeKey, coordinatorKey)
-            .tell(RiskSignalAgent.AcknowledgeSignalDelivery(signal.signalId, ackTime, None))
-
-          signal.outboxId.foreach { outboxId =>
-            oracleRepository.markOutboxDelivered(outboxId)
+      if !passivatedCustomers.contains(targetCustomerId) then
+        targetEntity
+          .ask[CustomerAgent.IngestionAck](replyTo => CustomerAgent.PropagatePeerRisk(signal, Some(replyTo)))
+          .foreach { _ =>
+            val ackTime = Instant.now()
             sharding
-              .entityRefFor(CustomerAgent.TypeKey, signal.fromCustomerId)
-              .tell(CustomerAgent.ConfirmOutboxDelivery(outboxId, None))
+              .entityRefFor(RiskSignalAgent.TypeKey, coordinatorKey)
+              .tell(RiskSignalAgent.AcknowledgeSignalDelivery(signal.signalId, ackTime, None))
+
+            signal.outboxId.foreach { outboxId =>
+              oracleRepository.markOutboxDelivered(outboxId)
+              if !passivatedCustomers.contains(signal.fromCustomerId) then
+                sharding
+                  .entityRefFor(CustomerAgent.TypeKey, signal.fromCustomerId)
+                  .tell(CustomerAgent.ConfirmOutboxDelivery(outboxId, None))
+            }
           }
+      else
+        signal.outboxId.foreach { outboxId =>
+          oracleRepository.markOutboxDelivered(outboxId)
         }
 
     override def retryPendingOutbox(
@@ -212,9 +218,10 @@ class CustomerClusterGateway(
             .tell(RelationshipAgent.RecordInteraction(tx, relRisk, None))
           result.outboxEntries.filter(_.targetType == OutboxTargetType.RelationshipAgent).foreach { entry =>
             oracleRepository.markOutboxDelivered(entry.outboxId)
-            sharding
-              .entityRefFor(CustomerAgent.TypeKey, customerId)
-              .tell(CustomerAgent.ConfirmOutboxDelivery(entry.outboxId, None))
+            if !passivatedCustomers.contains(customerId) then
+              sharding
+                .entityRefFor(CustomerAgent.TypeKey, customerId)
+                .tell(CustomerAgent.ConfirmOutboxDelivery(entry.outboxId, None))
           }
         case _ => ()
 

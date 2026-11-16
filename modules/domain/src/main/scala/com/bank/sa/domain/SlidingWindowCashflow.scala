@@ -93,12 +93,21 @@ final case class SlidingWindowCashflow(
   private def toEpochHour(instant: Instant): Long =
     instant.getEpochSecond / 3600L
 
+  /**
+   * Re-keys `buckets` using `HourlyCashflowBucket.epochHour` (primitive `Long`), protecting against
+   * Jackson CBOR snapshot deserialization where generic `Map[Long, _]` keys are erased to `String`.
+   */
+  def normalizedBuckets: Map[Long, HourlyCashflowBucket] =
+    if buckets.isEmpty then Map.empty
+    else buckets.valuesIterator.map(b => b.epochHour -> b).toMap
+
   def record(tx: EnrichedTransaction): SlidingWindowCashflow =
+    val cleanBuckets = normalizedBuckets
     val txHour       = toEpochHour(tx.timestamp)
-    val updatedEntry = buckets.getOrElse(txHour, HourlyCashflowBucket(txHour)).record(tx)
-    val maxHour      = math.max(txHour, buckets.keysIterator.maxOption.getOrElse(txHour))
+    val updatedEntry = cleanBuckets.getOrElse(txHour, HourlyCashflowBucket(txHour)).record(tx)
+    val maxHour      = math.max(txHour, cleanBuckets.valuesIterator.map(_.epochHour).maxOption.getOrElse(txHour))
     val cutoffHour   = maxHour - retentionHours
-    val pruned       = (buckets + (txHour -> updatedEntry)).filter { case (h, _) => h >= cutoffHour }
+    val pruned       = (cleanBuckets + (txHour -> updatedEntry)).filter { case (_, b) => b.epochHour >= cutoffHour }
     copy(buckets = pruned)
 
   def metricsForWindow(referenceTime: Instant, window: Duration): WindowMetrics =

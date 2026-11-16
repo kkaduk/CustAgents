@@ -341,7 +341,7 @@ object CustomerSituationSnapshotDto:
   ): CustomerSituationSnapshotDto =
     val ref        = if state.lastUpdatedAt.isAfter(Instant.EPOCH) then state.lastUpdatedAt else referenceTime
     val metrics30d = state.cashflow.metricsForWindow(ref, Duration.ofDays(30))
-    val factsMap = state.verifiedFacts.map { case (k, v) =>
+    val factsMap = state.normalizedVerifiedFacts.map { case (k, v) =>
       val valueStr = v.numericValue.map(_.toString).orElse(v.textValue).getOrElse("")
       k.toString -> s"$valueStr (docId=${v.docId}, issuer=${v.issuer})"
     }

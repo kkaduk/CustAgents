@@ -656,6 +656,24 @@ class CustomerSituationAwarenessSpec
         descDto.agentLifecycleStatus shouldBe "WOKEN_UP_BY_REST_QUERY"
         descDto.llmNarrativeDescription should include("CUST-HOT-MEGA-01")
         gateway.isCustomerPassivated("CUST-HOT-MEGA-01") shouldBe false
+
+        // 5. Ingest a new transaction into the snapshot-recovered CustomerAgent (CUST-HOT-MEGA-01)
+        //    to verify Jackson snapshot recovery of Map[Long, HourlyCashflowBucket] and Set[Long] digests
+        val postRecoveryTx = EnrichedTransaction(
+          txId = "TX-POST-SNAPSHOT-RECOVERY-01",
+          customerId = "CUST-HOT-MEGA-01",
+          counterpartyId = "METRO-GROCERY-MKT",
+          counterpartyIsBankClient = false,
+          direction = TransactionDirection.Outflow,
+          amount = BigDecimal("125.00"),
+          currency = "PLN",
+          category = TransactionCategory.EverydaySpend,
+          resultsInOverdraft = false,
+          restrictedTag = None,
+          timestamp = Instant.now()
+        )
+        val postAck = gateway.ingestTransaction(postRecoveryTx).futureValue
+        postAck.referenceId shouldBe "TX-POST-SNAPSHOT-RECOVERY-01"
       finally
         server.kafkaPipeline.close()
         binding.unbind().futureValue

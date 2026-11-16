@@ -222,21 +222,40 @@ final case class CustomerSituationState(
 ) extends Serializable:
 
   /**
+   * Protects against Jackson CBOR snapshot deserialization where `Map[DocumentFactType, _]` keys are erased to `String`
+   * and `Set[Long]` elements may be deserialized as `Integer` or `String`.
+   */
+  def normalizedVerifiedFacts: Map[DocumentFactType, VerifiedDocumentFact] =
+    if verifiedFacts.isEmpty then Map.empty
+    else verifiedFacts.valuesIterator.map(f => f.factType -> f).toMap
+
+  def normalizedDigests: Set[Long] =
+    if processedEventDigests.isEmpty then Set.empty
+    else
+      processedEventDigests.iterator.asInstanceOf[Iterator[Any]].flatMap {
+        case l: java.lang.Long   => Some(l.longValue())
+        case n: java.lang.Number => Some(n.longValue())
+        case s: String           => s.toLongOption
+        case _                   => None
+      }.toSet
+
+  /**
    * Idempotency check (Section 10 & Roadmap 9.5):
    * Checks both the recent event/tx ID list AND the 64-bit collision-resistant historical digest set (`Set[Long]`)
    * so duplicate historical events beyond the short recent list cannot mutate customer state twice.
    */
   def hasProcessedTx(txId: String): Boolean =
-    recentTxIds.contains(txId) || processedEventDigests.contains(CustomerSituationState.digest64(txId))
+    recentTxIds.contains(txId) || normalizedDigests.contains(CustomerSituationState.digest64(txId))
 
   def hasProcessedEvent(eventId: String): Boolean =
-    recentEventIds.contains(eventId) || recentTxIds.contains(eventId) || processedEventDigests.contains(CustomerSituationState.digest64(eventId))
+    recentEventIds.contains(eventId) || recentTxIds.contains(eventId) || normalizedDigests.contains(CustomerSituationState.digest64(eventId))
 
   def markEventProcessed(eventId: String): CustomerSituationState =
-    val digest = CustomerSituationState.digest64(eventId)
+    val digest       = CustomerSituationState.digest64(eventId)
+    val cleanDigests = normalizedDigests
     val updatedDigests =
-      if processedEventDigests.size >= 10000 then processedEventDigests.drop(1000) + digest
-      else processedEventDigests + digest
+      if cleanDigests.size >= 10000 then cleanDigests.drop(1000) + digest
+      else cleanDigests + digest
     copy(
       recentEventIds = (eventId :: recentEventIds).distinct.take(250),
       processedEventDigests = updatedDigests
@@ -293,10 +312,11 @@ final case class CustomerSituationState(
           Some(tx.timestamp)
         else situationSummary.lastSalaryObserved
 
-      val txDigest = CustomerSituationState.digest64(tx.txId)
+      val txDigest     = CustomerSituationState.digest64(tx.txId)
+      val cleanDigests = normalizedDigests
       val updatedDigests =
-        if processedEventDigests.size >= 10000 then processedEventDigests.drop(1000) + txDigest
-        else processedEventDigests + txDigest
+        if cleanDigests.size >= 10000 then cleanDigests.drop(1000) + txDigest
+        else cleanDigests + txDigest
 
       val updatedAccounts =
         (tx.direction match
@@ -374,7 +394,7 @@ final case class CustomerSituationState(
     else
       val latestTime = if fact.verifiedAt.isAfter(lastUpdatedAt) then fact.verifiedAt else lastUpdatedAt
       val baseUpdated = markEventProcessed(fact.docId).copy(
-        verifiedFacts = verifiedFacts.updated(fact.factType, fact),
+        verifiedFacts = normalizedVerifiedFacts.updated(fact.factType, fact),
         lastUpdatedAt = latestTime,
         stateVersion = stateVersion + 1L
       )
@@ -412,7 +432,8 @@ final case class CustomerSituationState(
   def recomputeSituationAwareness(referenceTime: Instant = lastUpdatedAt): CustomerSituationState =
     val ref        = if referenceTime.isAfter(Instant.EPOCH) then referenceTime else Instant.now()
     val metrics30d = cashflow.metricsForWindow(ref, Duration.ofDays(30))
-    val docIncome  = verifiedFacts.get(DocumentFactType.VerifiedMonthlyNetIncome).flatMap(_.numericValue)
+    val cleanFacts = normalizedVerifiedFacts
+    val docIncome  = cleanFacts.get(DocumentFactType.VerifiedMonthlyNetIncome).flatMap(_.numericValue)
     val monthlyInc = docIncome.getOrElse(metrics30d.totalInflow)
 
     val stability =
@@ -433,8 +454,8 @@ final case class CustomerSituationState(
       else if stability == IncomeStability.Unverified then "UNVERIFIED_INCOMPLETE"
       else "MODERATE_MONITORED"
 
-    val hasIncomeFact = verifiedFacts.contains(DocumentFactType.VerifiedMonthlyNetIncome)
-    val hasKycFact    = verifiedFacts.contains(DocumentFactType.KycVerificationStatus)
+    val hasIncomeFact = cleanFacts.contains(DocumentFactType.VerifiedMonthlyNetIncome)
+    val hasKycFact    = cleanFacts.contains(DocumentFactType.KycVerificationStatus)
     val hasTxHistory  = recentTxIds.nonEmpty
 
     val missing = List(

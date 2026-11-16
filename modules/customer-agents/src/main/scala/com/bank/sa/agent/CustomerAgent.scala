@@ -255,7 +255,6 @@ object CustomerAgent:
           RetentionCriteria.snapshotEvery(numberOfEvents = 50, keepNSnapshots = 2)
         ).receiveSignal {
           case (state, RecoveryCompleted) =>
-            peerRiskRouter.onAgentWokenUp(customerId, "SHARD_RECOVERY_WAKEUP", state.stateVersion)
             if state.pendingOutbox.nonEmpty then
               context.log.info(
                 "[CustomerAgent:{}] RecoveryCompleted with {} pending outbox entries; triggering reliable re-dispatch.",
